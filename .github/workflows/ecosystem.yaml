@@ -1,0 +1,20 @@
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 22 * * *"
+
+jobs:
+  ecosystem:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - uses: Swatinem/rust-cache@v1
+      - run: cargo build --all
+      - uses: actions/checkout@v3
+        with:
+          name: zulip/zulip
+          ref: refs/heads/release
+          path: ecosystem/zulip
+      - run: cargo run -- check --config ecosystem/zulip/pyproject.toml ecosystem/zulip
