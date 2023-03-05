@@ -1,7 +1,6 @@
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 22 * * *"
+  pull_request:
 
 jobs:
   ecosystem:
@@ -12,9 +11,12 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all
+      
       - uses: actions/checkout@v3
         with:
           name: zulip/zulip
           ref: refs/heads/main
           path: ecosystem/zulip
       - run: cargo run -- check --config ecosystem/zulip/pyproject.toml ecosystem/zulip
+      - name: Comment Pull Request
+        uses: thollander/actions-comment-pull-request@v2.3.1
