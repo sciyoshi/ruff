@@ -6,6 +6,8 @@ Example usage:
     scripts/check_ecosystem.py <path/to/ruff1> <path/to/ruff2>
 """
 
+# ruff: noqa: T201
+
 import argparse
 import asyncio
 import difflib
@@ -70,13 +72,13 @@ async def check(*, ruff: Path, path: Path) -> "Sequence[str]":
 
     result, err = await proc.communicate()
 
-    return sorted(
-        [
-            line
-            for line in result.decode("utf8").splitlines()
-            if not SUMMARY_LINE_RE.match(line)
-        ]
-    )
+    lines = [
+        line
+        for line in result.decode("utf8").splitlines()
+        if not SUMMARY_LINE_RE.match(line)
+    ]
+
+    return sorted(lines)
 
 
 class Diff(NamedTuple):
@@ -110,16 +112,25 @@ async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff:
 
 async def main(*, ruff1: Path, ruff2: Path) -> None:
     """Compare two versions of ruff against a corpus of open-source code."""
-    tasks = []
+    tasks = {}
 
     async with asyncio.TaskGroup() as tg:
-        tasks.append(
-            tg.create_task(
-                compare(ruff1, ruff2, REPOSITORIES["zulip"]),
-            ),
-        )
+        for name, repo in REPOSITORIES.items():
+            tasks[name] = tg.create_task(compare(ruff1, ruff2, repo))
 
-    print(tasks[0].result())
+    total_removed = total_added = 0
+
+    for task in tasks.values():
+        diff = task.result()
+        total_removed += len(diff.removed)
+        total_added += len(diff.added)
+
+    if total_removed == 0 and total_added == 0:
+        print("\u2705 ecosystem check detected no changes.")
+    else:
+        changes = f"(+{total_added}, -{total_removed})"
+
+        print(f"\u2139\ufe0f ecosystem check **detected changes**. {changes}")
 
 
 if __name__ == "__main__":

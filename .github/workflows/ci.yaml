@@ -146,3 +146,4 @@ jobs:
         uses: benc-uk/workflow-dispatch@v1.2.2
         with:
           workflow: ecosystem-comment.yaml
+          ref: ${{ github.event.pull_request.head.ref }}
