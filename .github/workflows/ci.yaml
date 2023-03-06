@@ -121,3 +121,20 @@ jobs:
       - uses: crate-ci/typos@master
         with:
           files: .
+
+  ecosystem:
+    name: "ecosystem"
+    runs-on: ubuntu-latest
+    needs: cargo-build
+    # Only runs on pull requests, since that is the only we way we can find the base version for comparison.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/download-artifact@v3
+        with:
+          name: ruff
+          path: target/debug/ruff
+      - uses: dawidd6/action-download-artifact@v2
+        with:
+          name: ruff
+          commit: ${{ github.event.pull_request.base.sha }}

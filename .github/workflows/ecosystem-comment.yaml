@@ -1,6 +1,6 @@
 on:
   workflow_run:
-    workflows: [ecosystem]
+    workflows: [CI]
     types: [completed]
 
 permissions:
@@ -9,5 +9,4 @@ permissions:
 jobs:
   comment:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
+    steps: []
