@@ -1,14 +1,19 @@
 on:
   workflow_run:
-    workflows: [ci]
+    workflows: [CI]
     types: [completed]
 
 jobs:
   ecosystem:
     runs-on: ubuntu-latest
+    # Only bother running ecosystem checks if the CI workflow succeeded.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v3
-      - name: "Install Rust toolchain"
-        run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all
+      
+      - name: Download ruff artifact from CI
+        id: download-artifact
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          run_id: ${{ github.event.workflow_run.id }}
+          name: ruff

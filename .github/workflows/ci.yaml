@@ -32,6 +32,7 @@ jobs:
       - run: git diff --exit-code -- README.md ruff.schema.json docs
       - uses: actions/upload-artifact@v3
         with:
+          name: ruff
           path: target/debug/ruff
 
   cargo-fmt:
