@@ -147,6 +147,7 @@ jobs:
           branch: ${{ github.event.pull_request.base_ref }}
           check_artifacts: true
       - run: |
+          chmod +x ruff ${{ steps.ruff-target.outputs.download-path }}
           scripts/check_ecosystem.py ruff ${{ steps.ruff-target.outputs.download-path }}
       - name: Dispatch ecosystem PR comment workflow
         uses: benc-uk/workflow-dispatch@v1.2.2
