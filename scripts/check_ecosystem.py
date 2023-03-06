@@ -11,6 +11,7 @@ Example usage:
 import argparse
 import asyncio
 import difflib
+import heapq
 import re
 import tempfile
 from asyncio.subprocess import PIPE, create_subprocess_exec
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Sequence, Iterator
 
 
 class Repository(NamedTuple):
@@ -36,6 +37,8 @@ class Repository(NamedTuple):
             process = await create_subprocess_exec(
                 "git",
                 "clone",
+                "--config",
+                "advice.detachedHead=false",
                 "--quiet",
                 "--depth",
                 "1",
@@ -52,7 +55,8 @@ class Repository(NamedTuple):
 
 
 REPOSITORIES = {
-    "zulip": Repository("zulip", "zulip", "main"),
+    # "zulip": Repository("zulip", "zulip", "main"),
+    "bokeh": Repository("bokeh", "bokeh", "branch-3.2"),
 }
 
 SUMMARY_LINE_RE = re.compile(r"^Found \d+ error.*$")
@@ -72,6 +76,9 @@ async def check(*, ruff: Path, path: Path) -> "Sequence[str]":
 
     result, err = await proc.communicate()
 
+    if proc.returncode != 0:
+        raise Exception(err)
+
     lines = [
         line
         for line in result.decode("utf8").splitlines()
@@ -84,17 +91,25 @@ async def check(*, ruff: Path, path: Path) -> "Sequence[str]":
 class Diff(NamedTuple):
     """A diff between two runs of ruff."""
 
-    removed: list[str]
-    added: list[str]
+    removed: set[str]
+    added: set[str]
 
     def __bool__(self: Self) -> bool:
         """Return true if this diff is non-empty."""
         return bool(self.removed or self.added)
 
+    def __iter__(self: Self) -> "Iterator[str]":
+        """Iterate through the changed lines in diff format."""
+        for line in heapq.merge(self.removed, self.added):
+            if line in self.removed:
+                yield f"- {line}"
+            else:
+                yield f"+ {line}"
+
 
 async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff:
     """Check a specific repository against two versions of ruff."""
-    removed, added = [], []
+    removed, added = set(), set()
 
     async with repo.clone() as path:
         async with asyncio.TaskGroup() as tg:
@@ -103,11 +118,16 @@ async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff:
 
         for line in difflib.ndiff(check1.result(), check2.result()):
             if line.startswith("- "):
-                removed.append(line[2:])
+                removed.add(line[2:])
             elif line.startswith("+ "):
-                added.append(line[2:])
+                added.add(line[2:])
 
     return Diff(removed, added)
+
+
+REPO_DIFF_COMMENT = """
+
+"""
 
 
 async def main(*, ruff1: Path, ruff2: Path) -> None:
@@ -118,10 +138,11 @@ async def main(*, ruff1: Path, ruff2: Path) -> None:
         for name, repo in REPOSITORIES.items():
             tasks[name] = tg.create_task(compare(ruff1, ruff2, repo))
 
+    diffs = { name: task.result() for name, task in tasks.items() }
+
     total_removed = total_added = 0
 
-    for task in tasks.values():
-        diff = task.result()
+    for diff in diffs.values():
         total_removed += len(diff.removed)
         total_added += len(diff.added)
 
@@ -131,7 +152,19 @@ async def main(*, ruff1: Path, ruff2: Path) -> None:
         changes = f"(+{total_added}, -{total_removed})"
 
         print(f"\u2139\ufe0f ecosystem check **detected changes**. {changes}")
+        print()
 
+        for name, diff in diffs.items():
+            print("<details><summary></summary>")
+            print("<p>")
+
+            diff_str = "\n".join(f"    {line}" for line in diff)
+
+            print("```diff")
+            print(diff_str)
+            print("```")
+            print("</p>")
+            print("</details>")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
