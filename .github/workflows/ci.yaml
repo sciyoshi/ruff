@@ -30,6 +30,9 @@ jobs:
       - run: git diff --quiet README.md || echo "::error file=README.md::This file is outdated. Run 'cargo dev generate-all'."
       - run: git diff --quiet ruff.schema.json || echo "::error file=ruff.schema.json::This file is outdated. Run 'cargo dev generate-all'."
       - run: git diff --exit-code -- README.md ruff.schema.json docs
+      - uses: actions/upload-artifact@v3
+        with:
+          path: target/debug/ruff
 
   cargo-fmt:
     name: "cargo fmt"

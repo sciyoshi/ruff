@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Sequence
 
 
 class Repository(NamedTuple):
@@ -29,7 +29,7 @@ class Repository(NamedTuple):
 
     @asynccontextmanager
     async def clone(self: Self) -> "AsyncIterator[Path]":
-        """Shallow clone a repository at a specific ref."""
+        """Shallow clone this repository to a temporary directory."""
         with tempfile.TemporaryDirectory() as tmpdir:
             process = await create_subprocess_exec(
                 "git",
@@ -56,7 +56,7 @@ REPOSITORIES = {
 SUMMARY_LINE_RE = re.compile(r"^Found \d+ error.*$")
 
 
-async def check(*, ruff: Path, path: Path) -> "Iterator[str]":
+async def check(*, ruff: Path, path: Path) -> "Sequence[str]":
     """Run the given ruff binary against the specified path."""
     proc = await create_subprocess_exec(
         ruff.absolute(),
@@ -70,15 +70,29 @@ async def check(*, ruff: Path, path: Path) -> "Iterator[str]":
 
     result, err = await proc.communicate()
 
-    return sorted([
-        line for line in result.decode("utf8").splitlines()
-        if not SUMMARY_LINE_RE.match(line)
-    ])
+    return sorted(
+        [
+            line
+            for line in result.decode("utf8").splitlines()
+            if not SUMMARY_LINE_RE.match(line)
+        ]
+    )
 
 
-async def compare(*, ruff1: Path, ruff2: Path, name: str) -> bool:
+class Diff(NamedTuple):
+    """A diff between two runs of ruff."""
+
+    removed: list[str]
+    added: list[str]
+
+    def __bool__(self: Self) -> bool:
+        """Return true if this diff is non-empty."""
+        return bool(self.removed or self.added)
+
+
+async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff:
     """Check a specific repository against two versions of ruff."""
-    repo = REPOSITORIES[name]
+    removed, added = [], []
 
     async with repo.clone() as path:
         async with asyncio.TaskGroup() as tg:
@@ -86,10 +100,12 @@ async def compare(*, ruff1: Path, ruff2: Path, name: str) -> bool:
             check2 = tg.create_task(check(ruff=ruff2, path=path))
 
         for line in difflib.ndiff(check1.result(), check2.result()):
-            if line.startswith(('- ', '+ ')):
-                print(line)
+            if line.startswith("- "):
+                removed.append(line[2:])
+            elif line.startswith("+ "):
+                added.append(line[2:])
 
-    return True
+    return Diff(removed, added)
 
 
 async def main(*, ruff1: Path, ruff2: Path) -> None:
@@ -97,7 +113,11 @@ async def main(*, ruff1: Path, ruff2: Path) -> None:
     tasks = []
 
     async with asyncio.TaskGroup() as tg:
-        tasks.append(tg.create_task(compare(ruff1=ruff1, ruff2=ruff2, name="zulip")))
+        tasks.append(
+            tg.create_task(
+                compare(ruff1, ruff2, REPOSITORIES["zulip"]),
+            ),
+        )
 
     print(tasks[0].result())
 
