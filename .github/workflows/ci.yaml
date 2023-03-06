@@ -134,14 +134,19 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: actions/download-artifact@v3
+        id: ruff-target
         with:
           name: ruff
           path: target/debug/ruff
       - uses: dawidd6/action-download-artifact@v2
+        id: ruff-base
         with:
           name: ruff
           branch: ${{ github.event.pull_request.base_ref }}
           check_artifacts: true
+      - run: |
+          echo ${{ steps.ruff-target.outputs.download-path }}
+          echo ${{ steps.ruff-base.outputs.artifacts[0] }}
       - name: Dispatch ecosystem PR comment workflow
         uses: benc-uk/workflow-dispatch@v1.2.2
         with:

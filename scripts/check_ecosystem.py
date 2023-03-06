@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two versions of ruff against a corpus of open-source code.
+"""Check two versions of ruff against a corpus of open-source code.
 
 Example usage:
 
@@ -14,13 +14,14 @@ import difflib
 import heapq
 import re
 import tempfile
+import textwrap
 from asyncio.subprocess import PIPE, create_subprocess_exec
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Self
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence, Iterator
+    from collections.abc import AsyncIterator, Iterator, Sequence
 
 
 class Repository(NamedTuple):
@@ -55,11 +56,15 @@ class Repository(NamedTuple):
 
 
 REPOSITORIES = {
-    # "zulip": Repository("zulip", "zulip", "main"),
+    "zulip": Repository("zulip", "zulip", "main"),
     "bokeh": Repository("bokeh", "bokeh", "branch-3.2"),
 }
 
 SUMMARY_LINE_RE = re.compile(r"^Found \d+ error.*$")
+
+
+class RuffError(Exception):
+    """An error reported by ruff."""
 
 
 async def check(*, ruff: Path, path: Path) -> "Sequence[str]":
@@ -77,7 +82,7 @@ async def check(*, ruff: Path, path: Path) -> "Sequence[str]":
     result, err = await proc.communicate()
 
     if proc.returncode != 0:
-        raise Exception(err)
+        raise RuffError(err.decode("utf8"))
 
     lines = [
         line
@@ -107,14 +112,17 @@ class Diff(NamedTuple):
                 yield f"+ {line}"
 
 
-async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff:
+async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff | None:
     """Check a specific repository against two versions of ruff."""
     removed, added = set(), set()
 
     async with repo.clone() as path:
-        async with asyncio.TaskGroup() as tg:
-            check1 = tg.create_task(check(ruff=ruff1, path=path))
-            check2 = tg.create_task(check(ruff=ruff2, path=path))
+        try:
+            async with asyncio.TaskGroup() as tg:
+                check1 = tg.create_task(check(ruff=ruff1, path=path))
+                check2 = tg.create_task(check(ruff=ruff2, path=path))
+        except ExceptionGroup as e:
+            raise e.exceptions[0] from e
 
         for line in difflib.ndiff(check1.result(), check2.result()):
             if line.startswith("- "):
@@ -125,50 +133,57 @@ async def compare(ruff1: Path, ruff2: Path, repo: Repository) -> Diff:
     return Diff(removed, added)
 
 
-REPO_DIFF_COMMENT = """
-
-"""
-
-
 async def main(*, ruff1: Path, ruff2: Path) -> None:
-    """Compare two versions of ruff against a corpus of open-source code."""
-    tasks = {}
+    """Check two versions of ruff against a corpus of open-source code."""
+    results = await asyncio.gather(
+        *[compare(ruff1, ruff2, repo) for repo in REPOSITORIES.values()],
+        return_exceptions=True,
+    )
 
-    async with asyncio.TaskGroup() as tg:
-        for name, repo in REPOSITORIES.items():
-            tasks[name] = tg.create_task(compare(ruff1, ruff2, repo))
-
-    diffs = { name: task.result() for name, task in tasks.items() }
+    diffs = { name: result for name, result in zip(REPOSITORIES, results, strict=True) }
 
     total_removed = total_added = 0
+    errors = 0
 
     for diff in diffs.values():
-        total_removed += len(diff.removed)
-        total_added += len(diff.added)
+        if isinstance(diff, Exception):
+            errors += 1
+        else:
+            total_removed += len(diff.removed)
+            total_added += len(diff.added)
 
-    if total_removed == 0 and total_added == 0:
+    if total_removed == 0 and total_added == 0 and errors == 0:
         print("\u2705 ecosystem check detected no changes.")
     else:
-        changes = f"(+{total_added}, -{total_removed})"
+        changes = f"(+{total_added}, -{total_removed}, {errors} error(s))"
 
         print(f"\u2139\ufe0f ecosystem check **detected changes**. {changes}")
         print()
 
         for name, diff in diffs.items():
-            print("<details><summary></summary>")
+            print(f"<details><summary>{name}</summary>")
             print("<p>")
 
-            diff_str = "\n".join(f"    {line}" for line in diff)
+            if isinstance(diff, Exception):
+                print("```")
+                print(textwrap.indent(str(diff), "    "))
+                print("```")
+            elif diff:
+                diff_str = "\n".join(f"    {line}" for line in diff)
 
-            print("```diff")
-            print(diff_str)
-            print("```")
+                print("```diff")
+                print(diff_str)
+                print("```")
+            else:
+                print("_No changes detected_.")
+
             print("</p>")
             print("</details>")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compare two versions of ruff against a corpus of open-source code.",
+        description="Check two versions of ruff against a corpus of open-source code.",
         epilog="scripts/check_ecosystem.py <path/to/ruff1> <path/to/ruff2>",
     )
 
