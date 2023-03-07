@@ -201,7 +201,7 @@ mod tests {
                 &[],
                 &[],
                 &Settings {
-                    line_length,
+                    line_length: line_length + 5,
                     ..Settings::for_rule(Rule::LineTooLong)
                 },
                 flags::Autofix::Enabled,

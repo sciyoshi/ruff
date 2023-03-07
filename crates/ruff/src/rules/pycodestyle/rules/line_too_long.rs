@@ -26,7 +26,7 @@ pub fn line_too_long(lineno: usize, line: &str, settings: &Settings) -> Option<D
     if is_overlong(
         line,
         line_length,
-        limit,
+        limit - 5,
         settings.pycodestyle.ignore_overlong_task_comments,
         &settings.task_tags,
     ) {

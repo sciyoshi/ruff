@@ -1,5 +1,5 @@
 ---
-source: src/rules/pycodestyle/mod.rs
+source: crates/ruff/src/rules/pycodestyle/mod.rs
 expression: diagnostics
 ---
 - kind:
@@ -12,6 +12,30 @@ expression: diagnostics
   end_location:
     row: 5
     column: 123
+  fix: ~
+  parent: ~
+- kind:
+    LineTooLong:
+      - 88
+      - 88
+  location:
+    row: 15
+    column: 88
+  end_location:
+    row: 15
+    column: 88
+  fix: ~
+  parent: ~
+- kind:
+    LineTooLong:
+      - 88
+      - 88
+  location:
+    row: 16
+    column: 88
+  end_location:
+    row: 16
+    column: 88
   fix: ~
   parent: ~
 - kind:
