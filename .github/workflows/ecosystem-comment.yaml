@@ -14,6 +14,7 @@ jobs:
           name: ecosystem-result
           workflow: CI
           commit: ${{ github.sha }}
+          workflow_conclusion: ""
           check_artifacts: true
       - name: Create comment
         uses: thollander/actions-comment-pull-request@v2
