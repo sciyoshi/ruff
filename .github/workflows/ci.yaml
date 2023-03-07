@@ -160,7 +160,3 @@ jobs:
           path: |
             ecosystem-result
             pr-number
-      - name: Dispatch ecosystem PR comment workflow
-        uses: benc-uk/workflow-dispatch@v1.2.2
-        with:
-          workflow: ecosystem-comment.yaml

@@ -1,7 +1,10 @@
 on:
-  workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
 
-permissions: write-all
+permissions:
+  pull-requests: write
 
 jobs:
   comment:
@@ -9,12 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: dawidd6/action-download-artifact@v2
+        id: download-result
         with:
           name: ecosystem-result
           workflow: CI
-          commit: ${{ github.sha }}
-          workflow_conclusion: ""
           check_artifacts: true
+          if_no_artifact_found: ignore
+      - run: |
+          echo ${{ steps.download-result.outputs.found_artifact }}
       - name: Create comment
         uses: thollander/actions-comment-pull-request@v2
         with:
