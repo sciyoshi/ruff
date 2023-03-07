@@ -140,19 +140,19 @@ jobs:
         id: ruff-target
         with:
           name: ruff
-          path: target/debug/ruff
+          path: target/debug
       - uses: dawidd6/action-download-artifact@v2
         with:
           name: ruff
           branch: ${{ github.event.pull_request.base_ref }}
           check_artifacts: true
       - run: |
-          chmod +x ruff ${{ steps.ruff-target.outputs.download-path }}
+          chmod +x ruff ${{ steps.ruff-target.outputs.download-path }}/ruff
           ls -l ruff
           ./ruff help
-          ls -l ${{ steps.ruff-target.outputs.download-path }}
-          ${{ steps.ruff-target.outputs.download-path }} help
-          scripts/check_ecosystem.py ruff ${{ steps.ruff-target.outputs.download-path }}
+          ls -l ${{ steps.ruff-target.outputs.download-path }}/ruff
+          ${{ steps.ruff-target.outputs.download-path }}/ruff help
+          scripts/check_ecosystem.py ruff ${{ steps.ruff-target.outputs.download-path }}/ruff
       - name: Dispatch ecosystem PR comment workflow
         uses: benc-uk/workflow-dispatch@v1.2.2
         with:
