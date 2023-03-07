@@ -165,3 +165,4 @@ jobs:
         with:
           workflow: ecosystem-comment.yaml
           ref: ${{ github.event.pull_request.head.ref }}
+          inputs: '{ "pr_number": ${{ github.event.number }} }'
