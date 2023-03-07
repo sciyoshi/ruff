@@ -11,12 +11,13 @@ jobs:
       - uses: dawidd6/action-download-artifact@v2
         with:
           name: ecosystem-result
-          branch: ${{ github.event.pull_request.head.ref }}
+          workflow: CI
+          commit: ${{ github.ref }}
           check_artifacts: true
       - name: Create comment
         uses: thollander/actions-comment-pull-request@v2
         with:
-          pr_number: ${{ github }}
+          pr_number: 1
           message: |
             ecosystem check!
           comment_tag: ecosystem-results
