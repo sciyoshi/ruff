@@ -13,7 +13,7 @@ jobs:
         with:
           name: ecosystem-result
           workflow: CI
-          commit: ${{ github.ref }}
+          commit: ${{ github.sha }}
           check_artifacts: true
       - name: Create comment
         uses: thollander/actions-comment-pull-request@v2
