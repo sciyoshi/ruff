@@ -8,14 +8,15 @@ jobs:
   comment:
     runs-on: ubuntu-latest
     steps:
+      - uses: dawidd6/action-download-artifact@v2
+        with:
+          name: ecosystem-result
+          branch: ${{ github.event.pull_request.head.ref }}
+          check_artifacts: true
       - name: Create comment
         uses: thollander/actions-comment-pull-request@v2
         with:
           pr_number: 1
           message: |
-            This is a multi-line test comment
-            - With GitHub **Markdown** :sparkles:
-            - Created by [create-or-update-comment][1]
-
-            [1]: https://github.com/peter-evans/create-or-update-comment
+            ecosystem check!
           comment_tag: ecosystem-results

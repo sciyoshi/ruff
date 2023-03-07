@@ -146,13 +146,16 @@ jobs:
           name: ruff
           branch: ${{ github.event.pull_request.base_ref }}
           check_artifacts: true
-      - run: |
+      - name: Run ecosystem check
+        run: |
+          # Make executable, since artifact download doesn't preserve this
           chmod +x ruff ${{ steps.ruff-target.outputs.download-path }}/ruff
-          ls -l ruff
-          ./ruff help
-          ls -l ${{ steps.ruff-target.outputs.download-path }}/ruff
-          ${{ steps.ruff-target.outputs.download-path }}/ruff help
-          scripts/check_ecosystem.py ruff ${{ steps.ruff-target.outputs.download-path }}/ruff
+
+          scripts/check_ecosystem.py ruff ${{ steps.ruff-target.outputs.download-path }}/ruff | tee ecosystem-result
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ecosystem-result
+          path: ecosystem-result
       - name: Dispatch ecosystem PR comment workflow
         uses: benc-uk/workflow-dispatch@v1.2.2
         with:
