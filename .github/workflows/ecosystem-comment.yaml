@@ -1,10 +1,5 @@
 on:
   workflow_dispatch:
-    inputs:
-      pr_number:
-        description: PR Number
-        required: true
-        type: number
 
 permissions:
   pull-requests: write
