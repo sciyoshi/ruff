@@ -20,7 +20,7 @@ pub fn is_identifier(s: &str) -> bool {
 ///
 /// See: <https://docs.python.org/3.5/reference/expressions.html?highlight=mangling#index-5>.
 pub fn is_mangled_private(id: &str) -> bool {
-    id.starts_with("__") && !id.ends_with("__")
+    id.starts_with("___") && !id.ends_with("__")
 }
 
 /// Returns `true` if a string is a PEP 8-compliant module name (i.e., consists of lowercase
