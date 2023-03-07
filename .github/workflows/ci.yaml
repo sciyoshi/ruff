@@ -149,7 +149,9 @@ jobs:
       - run: |
           chmod +x ruff ${{ steps.ruff-target.outputs.download-path }}
           ls -l ruff
+          ./ruff help
           ls -l ${{ steps.ruff-target.outputs.download-path }}
+          ${{ steps.ruff-target.outputs.download-path }} help
           scripts/check_ecosystem.py ruff ${{ steps.ruff-target.outputs.download-path }}
       - name: Dispatch ecosystem PR comment workflow
         uses: benc-uk/workflow-dispatch@v1.2.2
