@@ -4,7 +4,7 @@ use std::rc::Rc;
 use itertools::Itertools;
 use ruff_db::diagnostic::{Annotation, DiagnosticId, Severity};
 use ruff_db::files::File;
-use ruff_db::parsed::ParsedModuleRef;
+use ruff_db::parsed::{ParsedModuleRef, parsed_module};
 use ruff_db::source::source_text;
 use ruff_python_ast::helpers::is_dotted_name;
 use ruff_python_ast::name::Name;
@@ -18,7 +18,7 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator;
-use ty_module_resolver::{KnownModule, ModuleName, resolve_module};
+use ty_module_resolver::{KnownModule, ModuleName, file_to_module, resolve_module};
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
@@ -41,7 +41,25 @@ use crate::types::add_inferred_python_version_hint_to_diagnostic;
 use crate::types::call::bind::MatchingOverloadIndex;
 use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
 use crate::types::callable::CallableTypeKind;
-use crate::types::class::{ClassLiteral, CodeGeneratorKind, MethodDecorator};
+use crate::types::class::django_model::{
+    DjangoBulkFieldLookup, DjangoLookupExpectedType, DjangoRelationLookup,
+    django_bulk_field_lookup, django_generic_prefetch_related_lookup, django_lookup_expected_type,
+    django_lookup_suffix_type, django_manager_method_returns_queryset,
+    django_meta_get_field_return_type, django_meta_has_field,
+    django_model_init_positional_field_names, django_prefetch_related_lookup,
+    django_prefetch_related_model, django_queryset_base_instance_with_model_and_row_type,
+    django_queryset_instance_for_model_manager, django_queryset_instance_for_reverse_manager,
+    django_queryset_with_model_and_row_type, django_queryset_with_row_type,
+    django_select_related_lookup, django_settings_member_type, django_values_all_fields_row_type,
+    django_values_list_all_fields_columns, django_values_list_all_fields_row_type,
+    is_django_querydict_instance, is_django_queryset_class, is_django_queryset_instance,
+    is_django_queryset_or_manager_instance_by_name, model_instance_from_django_queryset_like,
+    resolve_auth_user_model_reference, resolve_stdlib_instance, static_class_from_instance,
+};
+use crate::types::class::{
+    ClassLiteral, CodeGeneratorKind, DynamicNamedTupleAnchor, DynamicNamedTupleLiteral,
+    MethodDecorator, NamedTupleField, NamedTupleSpec, StaticClassLiteral,
+};
 use crate::types::constraints::{ConstraintSetBuilder, PathBounds, Solutions};
 use crate::types::context::InferContext;
 use crate::types::diagnostic::{
@@ -51,16 +69,16 @@ use crate::types::diagnostic::{
     INVALID_LEGACY_TYPE_VARIABLE, INVALID_NEWTYPE, INVALID_PARAMSPEC, INVALID_TYPE_ALIAS_TYPE,
     INVALID_TYPE_FORM, INVALID_TYPE_GUARD_CALL, INVALID_TYPE_VARIABLE_BOUND,
     INVALID_TYPE_VARIABLE_CONSTRAINTS, POSSIBLY_MISSING_IMPLICIT_CALL, POSSIBLY_MISSING_SUBMODULE,
-    UNDEFINED_REVEAL, UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL, UNRESOLVED_REFERENCE,
-    UNSUPPORTED_OPERATOR, UNUSED_AWAITABLE, hint_if_stdlib_attribute_exists_on_other_versions,
-    report_attempted_protocol_instantiation, report_bad_dunder_delattr_call,
-    report_bad_dunder_delete_call, report_bad_dunder_set_call, report_call_to_abstract_method,
-    report_cannot_pop_required_field_on_typed_dict, report_invalid_assignment,
-    report_invalid_attribute_assignment, report_invalid_class_match_pattern,
-    report_invalid_exception_caught, report_invalid_exception_cause,
-    report_invalid_exception_raised, report_invalid_exception_tuple_caught,
-    report_invalid_generator_yield_type, report_invalid_key_on_typed_dict,
-    report_invalid_type_checking_constant,
+    UNDEFINED_REVEAL, UNKNOWN_ARGUMENT, UNRESOLVED_ATTRIBUTE, UNRESOLVED_GLOBAL,
+    UNRESOLVED_REFERENCE, UNSUPPORTED_OPERATOR, UNUSED_AWAITABLE,
+    hint_if_stdlib_attribute_exists_on_other_versions, report_attempted_protocol_instantiation,
+    report_bad_dunder_delattr_call, report_bad_dunder_delete_call, report_bad_dunder_set_call,
+    report_call_to_abstract_method, report_cannot_pop_required_field_on_typed_dict,
+    report_invalid_assignment, report_invalid_attribute_assignment,
+    report_invalid_class_match_pattern, report_invalid_exception_caught,
+    report_invalid_exception_cause, report_invalid_exception_raised,
+    report_invalid_exception_tuple_caught, report_invalid_generator_yield_type,
+    report_invalid_key_on_typed_dict, report_invalid_type_checking_constant,
     report_match_pattern_against_non_runtime_checkable_protocol,
     report_match_pattern_against_typed_dict, report_mismatched_type_name,
     report_possibly_missing_attribute, report_possibly_unresolved_reference,
@@ -89,6 +107,7 @@ use crate::types::subclass_of::SubclassOfInner;
 use crate::types::tuple::promotion::TupleSizePromotionConstraints;
 use crate::types::tuple::{Tuple, TupleLength, TupleSpecBuilder, TupleType};
 use crate::types::type_alias::{ManualPEP695TypeAliasType, PEP695TypeAliasType};
+use crate::types::typed_dict::{TypedDictSchema, functional_typed_dict_field};
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarConstraints, TypeVarIdentity};
 use crate::types::{
     BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType, CallableTypes, ClassType,
@@ -2301,7 +2320,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // This closure should only be called if `value_ty` was inferred with `attr_ty` as type context.
         let ensure_assignable_to =
             |builder: &Self, value_ty: Type<'db>, attr_ty: Type<'db>| -> bool {
-                let assignable = value_ty.is_assignable_to(db, attr_ty);
+                let assignable = value_ty.is_assignable_to(db, attr_ty)
+                    || Self::django_file_field_accepts_value(db, value_ty, attr_ty);
                 if !assignable && emit_diagnostics {
                     report_invalid_attribute_assignment(
                         &builder.context,
@@ -7184,6 +7204,2801 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.infer_call_expression_impl(call_expression, callable_type, tcx)
     }
 
+    fn check_django_queryset_lookup_call(
+        &mut self,
+        callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+    ) {
+        let attribute_method = match call_expression.func.as_ref() {
+            ast::Expr::Attribute(method_attr) => {
+                Some((method_attr.attr.as_str(), method_attr.value.as_ref()))
+            }
+            _ => None,
+        };
+        let bound_method = match callable_type {
+            Type::BoundMethod(bound_method) => Some(bound_method),
+            Type::Intersection(intersection) => {
+                intersection.positive(self.db()).iter().find_map(|ty| {
+                    if let Type::BoundMethod(bound_method) = ty {
+                        Some(*bound_method)
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        };
+        let method_name = bound_method
+            .map(|bound_method| bound_method.function(self.db()).name(self.db()).as_str())
+            .or_else(|| attribute_method.map(|(method_name, _)| method_name));
+
+        let Some(method_name) = method_name else {
+            return;
+        };
+        if !matches!(
+            method_name,
+            "filter"
+                | "exclude"
+                | "get"
+                | "aget"
+                | "create"
+                | "acreate"
+                | "get_or_create"
+                | "aget_or_create"
+                | "update_or_create"
+                | "aupdate_or_create"
+                | "order_by"
+                | "earliest"
+                | "latest"
+                | "aearliest"
+                | "alatest"
+                | "select_related"
+                | "prefetch_related"
+                | "defer"
+                | "only"
+                | "values"
+                | "values_list"
+                | "bulk_update"
+                | "abulk_update"
+                | "bulk_create"
+                | "abulk_create"
+        ) {
+            return;
+        }
+
+        let receiver_expression =
+            attribute_method.map(|(_, receiver_expression)| receiver_expression);
+        let receiver_ty = if let Some((_, receiver_expression)) = attribute_method {
+            self.expression_type(receiver_expression)
+        } else if let Some(bound_method) = bound_method {
+            bound_method.self_instance(self.db())
+        } else {
+            return;
+        };
+        let Some(model_instance) = model_instance_from_django_queryset_like(self.db(), receiver_ty)
+        else {
+            return;
+        };
+        let current_method_instance = self
+            .class_context_of_current_method()
+            .map(|class| Type::instance(self.db(), class));
+
+        if matches!(
+            method_name,
+            "bulk_update" | "abulk_update" | "bulk_create" | "abulk_create"
+        ) {
+            self.check_django_bulk_field_names(method_name, model_instance, call_expression);
+            return;
+        }
+
+        if matches!(method_name, "create" | "acreate") {
+            self.check_django_create_field_kwargs(
+                method_name,
+                model_instance,
+                call_expression,
+                current_method_instance,
+                false,
+            );
+            return;
+        }
+
+        if method_name == "select_related" {
+            for arg in &call_expression.arguments.args {
+                let ast::Expr::StringLiteral(string_literal) = arg else {
+                    continue;
+                };
+                let lookup_name = string_literal.value.to_str();
+                if lookup_name.is_empty() {
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                        continue;
+                    };
+                    builder.into_diagnostic("Empty Django select_related lookup");
+                    continue;
+                }
+                if receiver_expression.is_some_and(|receiver| {
+                    self.django_receiver_call_has_annotation_lookup(receiver, lookup_name)
+                }) {
+                    continue;
+                }
+                match django_select_related_lookup(self.db(), model_instance, lookup_name) {
+                    DjangoRelationLookup::Valid | DjangoRelationLookup::Dynamic => {}
+                    DjangoRelationLookup::UnknownField => {
+                        let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                            continue;
+                        };
+                        builder.into_diagnostic(format_args!(
+                            "Django select_related lookup `{lookup_name}` does not match any known model field"
+                        ));
+                    }
+                    DjangoRelationLookup::NotRelation => {
+                        let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, arg)
+                        else {
+                            continue;
+                        };
+                        builder.into_diagnostic(format_args!(
+                            "Django select_related lookup `{lookup_name}` does not resolve to a relation"
+                        ));
+                    }
+                }
+            }
+            return;
+        }
+
+        if method_name == "prefetch_related" {
+            for arg in &call_expression.arguments.args {
+                let (lookup_name, is_generic_prefetch) = match arg {
+                    ast::Expr::StringLiteral(string_literal) => {
+                        (string_literal.value.to_str(), false)
+                    }
+                    ast::Expr::Call(prefetch_call) => {
+                        let Some(lookup_name) = prefetch_call
+                            .arguments
+                            .args
+                            .first()
+                            .and_then(|lookup| match lookup {
+                                ast::Expr::StringLiteral(string_literal) => {
+                                    Some(string_literal.value.to_str())
+                                }
+                                _ => None,
+                            })
+                            .or_else(|| {
+                                Self::django_prefetch_string_keyword(prefetch_call, "lookup")
+                            })
+                        else {
+                            continue;
+                        };
+                        (
+                            lookup_name,
+                            Self::is_django_generic_prefetch_call(prefetch_call),
+                        )
+                    }
+                    _ => continue,
+                };
+                if lookup_name.is_empty() {
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                        continue;
+                    };
+                    builder.into_diagnostic("Empty Django prefetch_related lookup");
+                    continue;
+                }
+                let lookup_result = if is_generic_prefetch {
+                    django_generic_prefetch_related_lookup(self.db(), model_instance, lookup_name)
+                } else {
+                    django_prefetch_related_lookup(self.db(), model_instance, lookup_name)
+                };
+                match lookup_result {
+                    DjangoRelationLookup::Valid | DjangoRelationLookup::Dynamic => {}
+                    DjangoRelationLookup::UnknownField => {
+                        let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                            continue;
+                        };
+                        builder.into_diagnostic(format_args!(
+                            "Django prefetch_related lookup `{lookup_name}` does not match any known model field"
+                        ));
+                    }
+                    DjangoRelationLookup::NotRelation => {
+                        let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, arg)
+                        else {
+                            continue;
+                        };
+                        if is_generic_prefetch {
+                            builder.into_diagnostic(format_args!(
+                                "Django GenericPrefetch lookup `{lookup_name}` does not resolve to a GenericForeignKey"
+                            ));
+                        } else {
+                            builder.into_diagnostic(format_args!(
+                                "Django prefetch_related lookup `{lookup_name}` does not resolve to a relation"
+                            ));
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if matches!(method_name, "defer" | "only" | "values" | "values_list") {
+            for arg in &call_expression.arguments.args {
+                let ast::Expr::StringLiteral(string_literal) = arg else {
+                    continue;
+                };
+                let lookup_name = string_literal.value.to_str();
+                if receiver_expression.is_some_and(|receiver| {
+                    self.django_receiver_call_has_annotation_lookup(receiver, lookup_name)
+                }) {
+                    continue;
+                }
+                if matches!(
+                    self.django_lookup_expected_type_for_queryset_receiver(
+                        receiver_ty,
+                        model_instance,
+                        lookup_name
+                    ),
+                    DjangoLookupExpectedType::UnknownField
+                ) {
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                        "Django {method_name} lookup `{lookup_name}` does not match any known model field"
+                    ));
+                }
+            }
+            return;
+        }
+
+        if matches!(
+            method_name,
+            "order_by" | "earliest" | "latest" | "aearliest" | "alatest"
+        ) {
+            for arg in &call_expression.arguments.args {
+                let ast::Expr::StringLiteral(string_literal) = arg else {
+                    continue;
+                };
+                let lookup_name = string_literal.value.to_str();
+                let lookup_name = lookup_name.strip_prefix('-').unwrap_or(lookup_name);
+                if lookup_name == "?" {
+                    continue;
+                }
+                if receiver_expression.is_some_and(|receiver| {
+                    self.django_receiver_call_has_annotation_lookup(receiver, lookup_name)
+                }) {
+                    continue;
+                }
+                let lookup_base = lookup_name.split("__").next().unwrap_or(lookup_name);
+                if self.django_annotation_protocol_has_member(model_instance, lookup_base)
+                    || self
+                        .django_queryset_selected_row_contains_item(receiver_ty, lookup_base)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some(suffix) = lookup_name.rsplit("__").next()
+                    && lookup_name.contains("__")
+                    && Self::is_django_lookup_suffix_disallowed_in_ordering(suffix)
+                {
+                    let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, arg)
+                    else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                        "Django ordering `{lookup_name}` uses lookup suffix `{suffix}` instead of a field transform"
+                    ));
+                    continue;
+                }
+                if matches!(
+                    self.django_lookup_expected_type_for_queryset_receiver(
+                        receiver_ty,
+                        model_instance,
+                        lookup_name
+                    ),
+                    DjangoLookupExpectedType::UnknownField
+                ) {
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                        "Django ordering `{lookup_name}` does not match any known model field"
+                    ));
+                }
+            }
+            return;
+        }
+
+        for keyword in &call_expression.arguments.keywords {
+            let Some(keyword_name) = keyword.arg.as_ref() else {
+                continue;
+            };
+            if !matches!(keyword_name.as_str(), "defaults" | "create_defaults") {
+                continue;
+            }
+            let ast::Expr::Dict(dict) = &keyword.value else {
+                continue;
+            };
+            for item in &dict.items {
+                let Some(key) = item.key.as_ref() else {
+                    continue;
+                };
+                let ast::Expr::StringLiteral(key_literal) = key else {
+                    continue;
+                };
+                let field_name = key_literal.value.to_str();
+                let actual_type = self.expression_type(&item.value);
+                match self.django_lookup_expected_type_for_queryset_receiver(
+                    receiver_ty,
+                    model_instance,
+                    field_name,
+                ) {
+                    DjangoLookupExpectedType::Expected(expected_type) => {
+                        if Self::django_lookup_accepts_value(
+                            self.db(),
+                            actual_type,
+                            expected_type,
+                            current_method_instance,
+                        ) || Self::is_django_default_callable(self.db(), actual_type)
+                            || Self::is_django_expression_like(self.db(), actual_type)
+                            || Self::is_enum_literal(actual_type)
+                        {
+                            continue;
+                        }
+                        let Some(builder) = self
+                            .context
+                            .report_lint(&INVALID_ARGUMENT_TYPE, &item.value)
+                        else {
+                            continue;
+                        };
+                        builder
+                            .into_diagnostic(format_args!(
+                                "Incompatible type for Django default `{field_name}`"
+                            ))
+                            .set_primary_message(format_args!(
+                                "Expected `{}`, found `{}`",
+                                expected_type.display(self.db()),
+                                actual_type.display(self.db())
+                            ));
+                    }
+                    DjangoLookupExpectedType::UnknownField => {
+                        if let Some(model_class) =
+                            static_class_from_instance(self.db(), model_instance)
+                            && let Some(expected_type) =
+                                self.django_model_writable_property_type(model_class, field_name)
+                        {
+                            if Self::django_lookup_accepts_value(
+                                self.db(),
+                                actual_type,
+                                expected_type,
+                                current_method_instance,
+                            ) || Self::is_django_default_callable(self.db(), actual_type)
+                                || Self::is_django_expression_like(self.db(), actual_type)
+                                || Self::is_enum_literal(actual_type)
+                            {
+                                continue;
+                            }
+
+                            let Some(builder) = self
+                                .context
+                                .report_lint(&INVALID_ARGUMENT_TYPE, &item.value)
+                            else {
+                                continue;
+                            };
+                            builder
+                                .into_diagnostic(format_args!(
+                                    "Incompatible type for Django default `{field_name}`"
+                                ))
+                                .set_primary_message(format_args!(
+                                    "Expected `{}`, found `{}`",
+                                    expected_type.display(self.db()),
+                                    actual_type.display(self.db())
+                                ));
+                            continue;
+                        }
+
+                        let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, key) else {
+                            continue;
+                        };
+                        builder.into_diagnostic(format_args!(
+                            "Django default `{field_name}` does not match any known model field"
+                        ));
+                    }
+                    DjangoLookupExpectedType::Dynamic => {}
+                }
+            }
+        }
+
+        for keyword in &call_expression.arguments.keywords {
+            let Some(lookup_name) = keyword.arg.as_ref() else {
+                continue;
+            };
+            if matches!(lookup_name.as_str(), "defaults" | "create_defaults") {
+                continue;
+            }
+            let actual_type = self.expression_type(&keyword.value);
+            match self.django_lookup_expected_type_for_queryset_receiver(
+                receiver_ty,
+                model_instance,
+                lookup_name.as_str(),
+            ) {
+                DjangoLookupExpectedType::Expected(expected_type) => {
+                    if Self::django_lookup_accepts_value(
+                        self.db(),
+                        actual_type,
+                        expected_type,
+                        current_method_instance,
+                    ) || Self::is_django_expression_like(self.db(), actual_type)
+                        || Self::is_enum_literal(actual_type)
+                    {
+                        continue;
+                    }
+                    let Some(builder) = self
+                        .context
+                        .report_lint(&INVALID_ARGUMENT_TYPE, &keyword.value)
+                    else {
+                        continue;
+                    };
+                    builder
+                        .into_diagnostic(format_args!(
+                            "Incompatible type for Django lookup `{lookup_name}`"
+                        ))
+                        .set_primary_message(format_args!(
+                            "Expected `{}`, found `{}`",
+                            expected_type.display(self.db()),
+                            actual_type.display(self.db())
+                        ));
+                }
+                DjangoLookupExpectedType::UnknownField => {
+                    if receiver_expression.is_some_and(|receiver| {
+                        self.django_receiver_call_has_annotation_lookup(
+                            receiver,
+                            lookup_name.as_str(),
+                        )
+                    }) {
+                        continue;
+                    }
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, &keyword.value)
+                    else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                        "Django lookup `{lookup_name}` does not match any known model field"
+                    ));
+                }
+                DjangoLookupExpectedType::Dynamic => {}
+            }
+        }
+    }
+
+    fn is_django_lookup_suffix_disallowed_in_ordering(suffix: &str) -> bool {
+        matches!(
+            suffix,
+            "exact"
+                | "iexact"
+                | "contains"
+                | "icontains"
+                | "startswith"
+                | "istartswith"
+                | "endswith"
+                | "iendswith"
+                | "isnull"
+                | "in"
+                | "range"
+                | "regex"
+                | "iregex"
+                | "lt"
+                | "lte"
+                | "gt"
+                | "gte"
+        )
+    }
+
+    fn django_receiver_call_has_annotation_lookup(
+        &self,
+        receiver: &'ast ast::Expr,
+        lookup_name: &str,
+    ) -> bool {
+        self.django_receiver_call_annotation_names(receiver)
+            .is_some_and(|annotation_names| {
+                annotation_names.iter().any(|annotation_name| {
+                    lookup_name == annotation_name
+                        || lookup_name
+                            .strip_prefix(annotation_name.as_str())
+                            .is_some_and(|suffix| suffix.starts_with("__"))
+                })
+            })
+    }
+
+    fn django_receiver_call_annotation_names(
+        &self,
+        receiver: &'ast ast::Expr,
+    ) -> Option<Vec<String>> {
+        let ast::Expr::Call(call) = receiver else {
+            return None;
+        };
+        let ast::Expr::Attribute(method_attr) = call.func.as_ref() else {
+            return None;
+        };
+        if !matches!(method_attr.attr.as_str(), "annotate" | "alias") {
+            return self.django_receiver_call_annotation_names(method_attr.value.as_ref());
+        }
+
+        let mut annotation_names = Vec::new();
+        for arg in &call.arguments.args {
+            if let Some(annotation_name) = Self::django_positional_annotation_name(arg) {
+                annotation_names.push(annotation_name);
+            }
+        }
+        for keyword in &call.arguments.keywords {
+            if let Some(keyword_name) = keyword.arg.as_deref() {
+                annotation_names.push(keyword_name.to_string());
+                continue;
+            }
+            for (annotation_name, _) in self.django_annotation_items_from_splat(&keyword.value) {
+                annotation_names.push(annotation_name);
+            }
+        }
+
+        Some(annotation_names)
+    }
+
+    fn django_annotation_items_from_splat(
+        &self,
+        splat: &'ast ast::Expr,
+    ) -> Vec<(String, &'ast ast::Expr)> {
+        match splat {
+            ast::Expr::Dict(dict) => Self::django_annotation_items_from_dict(dict),
+            ast::Expr::Name(name) => {
+                let db = self.db();
+                let file_scope_id = self.scope().file_scope_id(db);
+                let use_def = self.index.use_def_map(file_scope_id);
+                let use_id = name.scoped_use_id(db, self.scope());
+
+                let Some(definition) =
+                    place_from_bindings(db, use_def.bindings_at_use(use_id)).first_definition
+                else {
+                    return Vec::new();
+                };
+                if definition.file(db) != self.file() {
+                    return Vec::new();
+                }
+
+                let value = match definition.kind(db) {
+                    DefinitionKind::Assignment(assignment) => assignment.value(self.module()),
+                    DefinitionKind::AnnotatedAssignment(assignment) => {
+                        let Some(value) = assignment.value(self.module()) else {
+                            return Vec::new();
+                        };
+                        value
+                    }
+                    _ => return Vec::new(),
+                };
+                let ast::Expr::Dict(dict) = value else {
+                    return Vec::new();
+                };
+                Self::django_annotation_items_from_dict(dict)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn django_annotation_items_from_dict(
+        dict: &'ast ast::ExprDict,
+    ) -> Vec<(String, &'ast ast::Expr)> {
+        dict.items
+            .iter()
+            .filter_map(|item| {
+                let ast::Expr::StringLiteral(key) = item.key.as_ref()? else {
+                    return None;
+                };
+                Some((key.value.to_str().to_string(), &item.value))
+            })
+            .collect()
+    }
+
+    fn django_positional_annotation_name(expr: &ast::Expr) -> Option<String> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        let aggregate_name = match call.func.as_ref() {
+            ast::Expr::Name(name) => name.id.as_str(),
+            ast::Expr::Attribute(attribute) => attribute.attr.as_str(),
+            _ => return None,
+        };
+        let suffix = match aggregate_name {
+            "Avg" | "Count" | "Max" | "Min" | "StdDev" | "Sum" | "Variance" => {
+                aggregate_name.to_ascii_lowercase()
+            }
+            _ => return None,
+        };
+        let ast::Expr::StringLiteral(source) = call.arguments.args.first()? else {
+            return None;
+        };
+
+        Some(format!("{}__{suffix}", source.value.to_str()))
+    }
+
+    fn django_lookup_expected_type_for_model(
+        &self,
+        model_instance: Type<'db>,
+        lookup_name: &str,
+    ) -> DjangoLookupExpectedType<'db> {
+        let expected = django_lookup_expected_type(self.db(), model_instance, lookup_name);
+        if matches!(
+            expected,
+            DjangoLookupExpectedType::UnknownField | DjangoLookupExpectedType::Dynamic
+        ) && let Some(annotation_expected) =
+            self.django_annotation_protocol_lookup_type(model_instance, lookup_name)
+        {
+            return annotation_expected;
+        }
+        if !matches!(expected, DjangoLookupExpectedType::UnknownField) {
+            return expected;
+        }
+
+        expected
+    }
+
+    fn is_django_default_callable(db: &'db dyn Db, ty: Type<'db>) -> bool {
+        match ty {
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .all(|element| Self::is_django_default_callable(db, *element)),
+            Type::FunctionLiteral(_)
+            | Type::BoundMethod(_)
+            | Type::KnownBoundMethod(_)
+            | Type::Callable(_)
+            | Type::ClassLiteral(_) => true,
+            _ => false,
+        }
+    }
+
+    fn django_lookup_expected_type_for_queryset_receiver(
+        &self,
+        receiver_ty: Type<'db>,
+        model_instance: Type<'db>,
+        lookup_name: &str,
+    ) -> DjangoLookupExpectedType<'db> {
+        let expected = self.django_lookup_expected_type_for_model(model_instance, lookup_name);
+        if !matches!(expected, DjangoLookupExpectedType::UnknownField) {
+            return expected;
+        }
+
+        if let Some(annotation_expected) =
+            self.django_annotation_protocol_lookup_type(receiver_ty, lookup_name)
+        {
+            return annotation_expected;
+        }
+
+        expected
+    }
+
+    fn django_model_writable_property_type(
+        &self,
+        model_class: StaticClassLiteral<'db>,
+        member_name: &str,
+    ) -> Option<Type<'db>> {
+        let property = Type::from(model_class)
+            .member(self.db(), member_name)
+            .ignore_possibly_undefined()?
+            .as_property_instance()?;
+        let setter = property.setter(self.db())?.promote(self.db());
+        let callable = setter.as_callable()?;
+        let setter_value_types = callable.signatures(self.db()).iter().map(|signature| {
+            signature
+                .parameters()
+                .get(1)
+                .map(Parameter::annotated_type)
+                .unwrap_or_else(Type::unknown)
+        });
+
+        Some(UnionType::from_elements(self.db(), setter_value_types))
+    }
+
+    fn django_annotation_protocol_member_type(
+        &self,
+        model_instance: Type<'db>,
+        member_name: &str,
+    ) -> Option<Type<'db>> {
+        fn property_value_type<'db>(db: &'db dyn Db, ty: Type<'db>) -> Type<'db> {
+            let Type::PropertyInstance(property) = ty else {
+                return ty;
+            };
+            let Some(getter) = property.getter(db) else {
+                return ty;
+            };
+            getter
+                .as_callable()
+                .map(|callable| callable.signatures(db).overload_return_type_or_unknown(db))
+                .unwrap_or(ty)
+        }
+
+        let Type::Intersection(intersection) = model_instance else {
+            return None;
+        };
+        intersection.positive(self.db()).iter().find_map(|element| {
+            let Type::ProtocolInstance(protocol) = *element else {
+                return None;
+            };
+            protocol
+                .instance_member(self.db(), member_name)
+                .ignore_possibly_undefined()
+                .map(|ty| property_value_type(self.db(), ty))
+        })
+    }
+
+    fn django_annotation_protocol_lookup_type(
+        &self,
+        model_instance: Type<'db>,
+        lookup_name: &str,
+    ) -> Option<DjangoLookupExpectedType<'db>> {
+        if let Some(annotation_type) =
+            self.django_annotation_protocol_member_type(model_instance, lookup_name)
+        {
+            return Some(DjangoLookupExpectedType::Expected(annotation_type));
+        }
+
+        let mut separator_indices: Vec<_> = lookup_name
+            .match_indices("__")
+            .map(|(index, _)| index)
+            .collect();
+        separator_indices.reverse();
+        for index in separator_indices {
+            let annotation_name = &lookup_name[..index];
+            let lookup_suffix = &lookup_name[index + 2..];
+            if let Some(annotation_type) =
+                self.django_annotation_protocol_member_type(model_instance, annotation_name)
+            {
+                return Some(django_lookup_suffix_type(
+                    self.db(),
+                    lookup_suffix,
+                    annotation_type,
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn django_annotation_protocol_has_member(
+        &self,
+        model_instance: Type<'db>,
+        member_name: &str,
+    ) -> bool {
+        let Type::Intersection(intersection) = model_instance else {
+            return false;
+        };
+        intersection.positive(self.db()).iter().any(|element| {
+            let Type::ProtocolInstance(protocol) = *element else {
+                return false;
+            };
+            protocol
+                .instance_member(self.db(), member_name)
+                .ignore_possibly_undefined()
+                .is_some()
+        })
+    }
+
+    fn django_selected_row_contains_item(
+        &self,
+        row_ty: Type<'db>,
+        item_name: &str,
+    ) -> Option<bool> {
+        match row_ty {
+            Type::TypedDict(typed_dict) => {
+                Some(typed_dict.items(self.db()).contains_key(item_name))
+            }
+            _ => {
+                let class = row_ty.nominal_class(self.db())?;
+                let ClassLiteral::DynamicNamedTuple(named_tuple) = class.class_literal(self.db())
+                else {
+                    return None;
+                };
+                named_tuple.has_known_fields(self.db()).then(|| {
+                    named_tuple
+                        .field(self.db(), &Name::new(item_name))
+                        .is_some()
+                })
+            }
+        }
+    }
+
+    fn django_queryset_selected_row_contains_item(
+        &self,
+        queryset_ty: Type<'db>,
+        item_name: &str,
+    ) -> Option<bool> {
+        let row_ty = queryset_ty
+            .class_specialization(self.db())?
+            .types(self.db())
+            .get(1)
+            .copied()?;
+        self.django_selected_row_contains_item(row_ty, item_name)
+    }
+
+    fn django_selected_fields_from_receiver_values_list<'expr>(
+        call_expression: &'expr ast::ExprCall,
+    ) -> Option<FxHashSet<&'expr str>> {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return None;
+        };
+        let ast::Expr::Call(receiver_call) = method_attr.value.as_ref() else {
+            return None;
+        };
+        let receiver_method_name = match receiver_call.func.as_ref() {
+            ast::Expr::Attribute(attribute) => attribute.attr.as_str(),
+            ast::Expr::Name(name) => name.id.as_str(),
+            _ => return None,
+        };
+        if receiver_method_name != "values_list" {
+            return None;
+        }
+
+        let mut selected_fields = FxHashSet::default();
+        for arg in &receiver_call.arguments.args {
+            let ast::Expr::StringLiteral(string_literal) = arg else {
+                return None;
+            };
+            selected_fields.insert(string_literal.value.to_str());
+        }
+
+        (!selected_fields.is_empty()).then_some(selected_fields)
+    }
+
+    fn is_django_expression_like(db: &dyn Db, ty: Type) -> bool {
+        match ty {
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .any(|element| Self::is_django_expression_like(db, *element)),
+            Type::Intersection(intersection) => intersection
+                .positive(db)
+                .iter()
+                .any(|element| Self::is_django_expression_like(db, *element)),
+            _ => ty.nominal_class(db).is_some_and(|class| {
+                class
+                    .iter_mro(db)
+                    .filter_map(|base| base.into_class())
+                    .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
+                    .any(|base| {
+                        matches!(
+                            base.name(db).as_str(),
+                            "Combinable" | "CombinedExpression" | "F" | "Expression"
+                        )
+                    })
+            }),
+        }
+    }
+
+    fn is_enum_literal(ty: Type) -> bool {
+        matches!(
+            ty.as_literal_value_kind(),
+            Some(LiteralValueTypeKind::Enum(_))
+        )
+    }
+
+    fn nominal_class_matches(db: &'db dyn Db, actual: Type<'db>, expected: Type<'db>) -> bool {
+        let Some(actual_class) = actual.nominal_class(db) else {
+            return false;
+        };
+        let Some(expected_class) = expected.nominal_class(db) else {
+            return false;
+        };
+        let Some((expected_lit, _)) = expected_class.static_class_literal(db) else {
+            return false;
+        };
+
+        actual_class
+            .iter_mro(db)
+            .filter_map(|base| base.into_class())
+            .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
+            .any(|base| {
+                base == expected_lit
+                    || (base.is_django_model(db)
+                        && expected_lit.is_django_model(db)
+                        && base.name(db) == expected_lit.name(db))
+            })
+    }
+
+    fn django_numeric_lookup_accepts_value(
+        db: &'db dyn Db,
+        actual: Type<'db>,
+        expected: Type<'db>,
+    ) -> bool {
+        expected.is_instance_of(db, KnownClass::Float)
+            && (actual.is_instance_of(db, KnownClass::Int)
+                || matches!(
+                    actual.as_literal_value_kind(),
+                    Some(LiteralValueTypeKind::Int(_))
+                ))
+    }
+
+    fn type_has_nominal_class_name_in_mro(
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        class_names: &[&str],
+    ) -> bool {
+        ty.nominal_class(db).is_some_and(|class| {
+            class
+                .iter_mro(db)
+                .filter_map(|base| base.into_class())
+                .filter_map(|base| base.static_class_literal(db).map(|(base, _)| base))
+                .any(|base| class_names.contains(&base.name(db).as_str()))
+        })
+    }
+
+    fn django_file_field_accepts_value(
+        db: &'db dyn Db,
+        actual: Type<'db>,
+        expected: Type<'db>,
+    ) -> bool {
+        if let Type::Union(union) = actual {
+            return union
+                .elements(db)
+                .iter()
+                .all(|element| Self::django_file_field_accepts_value(db, *element, expected));
+        }
+
+        if let Type::Union(union) = expected {
+            return union
+                .elements(db)
+                .iter()
+                .any(|element| Self::django_file_field_accepts_value(db, actual, *element));
+        }
+
+        Self::type_has_nominal_class_name_in_mro(db, expected, &["FieldFile", "ImageFieldFile"])
+            && Self::type_has_nominal_class_name_in_mro(db, actual, &["File", "ContentFile"])
+    }
+
+    fn is_enum_instance(db: &'db dyn Db, ty: Type<'db>) -> bool {
+        ty.nominal_class(db)
+            .and_then(|class| class.static_class_literal(db).map(|(class, _)| class))
+            .is_some_and(|class| is_enum_class_by_inheritance(db, class))
+    }
+
+    fn is_str_or_int_instance(db: &'db dyn Db, ty: Type<'db>) -> bool {
+        if let Type::Intersection(intersection) = ty {
+            return intersection
+                .positive(db)
+                .iter()
+                .any(|element| Self::is_str_or_int_instance(db, *element));
+        }
+
+        if matches!(
+            ty.as_literal_value_kind(),
+            Some(LiteralValueTypeKind::String(_) | LiteralValueTypeKind::Int(_))
+        ) {
+            return true;
+        }
+
+        ty.is_instance_of(db, KnownClass::Str) || ty.is_instance_of(db, KnownClass::Int)
+    }
+
+    fn django_choices_enum_accepts_value(
+        db: &'db dyn Db,
+        actual: Type<'db>,
+        expected: Type<'db>,
+    ) -> bool {
+        if let Type::Union(union) = expected {
+            return union
+                .elements(db)
+                .iter()
+                .any(|element| Self::django_choices_enum_accepts_value(db, actual, *element));
+        }
+
+        if let Type::Union(union) = actual {
+            return union
+                .elements(db)
+                .iter()
+                .all(|element| Self::django_choices_enum_accepts_value(db, *element, expected));
+        }
+
+        (Self::is_enum_instance(db, expected) && Self::is_str_or_int_instance(db, actual))
+            || (Self::is_enum_instance(db, actual) && Self::is_str_or_int_instance(db, expected))
+    }
+
+    fn django_lookup_accepts_value(
+        db: &'db dyn Db,
+        actual: Type<'db>,
+        expected: Type<'db>,
+        current_method_instance: Option<Type<'db>>,
+    ) -> bool {
+        if actual.is_assignable_to(db, expected)
+            || Self::nominal_class_matches(db, actual, expected)
+            || Self::django_numeric_lookup_accepts_value(db, actual, expected)
+            || Self::django_file_field_accepts_value(db, actual, expected)
+            || Self::django_choices_enum_accepts_value(db, actual, expected)
+        {
+            return true;
+        }
+
+        if let Type::Union(union) = actual {
+            return union.elements(db).iter().all(|element| {
+                Self::django_lookup_accepts_value(db, *element, expected, current_method_instance)
+            });
+        }
+
+        if let Type::TypeVar(typevar) = actual {
+            let typevar_instance = typevar.typevar(db);
+            if typevar_instance.is_self(db)
+                && let Some(current_method_instance) = current_method_instance
+                && Self::django_lookup_accepts_value(db, current_method_instance, expected, None)
+            {
+                return true;
+            }
+            match typevar_instance.upper_bound(db) {
+                Some(bound) => {
+                    return Self::django_lookup_accepts_value(
+                        db,
+                        bound,
+                        expected,
+                        current_method_instance,
+                    );
+                }
+                None => {
+                    if let Some(constraints) = typevar_instance.constraints(db) {
+                        return constraints.iter().any(|constraint| {
+                            Self::django_lookup_accepts_value(
+                                db,
+                                *constraint,
+                                expected,
+                                current_method_instance,
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        match expected {
+            Type::Union(union) => union.elements(db).iter().any(|element| {
+                Self::django_lookup_accepts_value(db, actual, *element, current_method_instance)
+            }),
+            _ => false,
+        }
+    }
+
+    fn django_model_init_accepts_value(
+        db: &'db dyn Db,
+        actual: Type<'db>,
+        expected: Type<'db>,
+        current_method_instance: Option<Type<'db>>,
+    ) -> bool {
+        if Self::django_lookup_accepts_value(db, actual, expected, current_method_instance) {
+            return true;
+        }
+
+        let Type::Union(union) = actual else {
+            return actual.is_none(db);
+        };
+
+        let mut saw_none = false;
+        let mut saw_non_none = false;
+        for element in union.elements(db) {
+            if element.is_none(db) {
+                saw_none = true;
+                continue;
+            }
+            saw_non_none = true;
+            if !Self::django_lookup_accepts_value(db, *element, expected, current_method_instance) {
+                return false;
+            }
+        }
+
+        saw_none && (saw_non_none || expected.is_assignable_to(db, Type::object()))
+    }
+
+    fn check_django_create_field_kwargs(
+        &mut self,
+        method_name: &str,
+        model_instance: Type<'db>,
+        call_expression: &ast::ExprCall,
+        current_method_instance: Option<Type<'db>>,
+        allow_none: bool,
+    ) {
+        for keyword in &call_expression.arguments.keywords {
+            let Some(field_name) = keyword.arg.as_ref() else {
+                continue;
+            };
+
+            if field_name.contains("__") {
+                let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, &keyword.value)
+                else {
+                    continue;
+                };
+                builder.into_diagnostic(format_args!(
+                    "Django {method_name} argument `{field_name}` does not match any known model field"
+                ));
+                continue;
+            }
+
+            let actual_type = self.expression_type(&keyword.value);
+            match self.django_lookup_expected_type_for_model(model_instance, field_name.as_str()) {
+                DjangoLookupExpectedType::Expected(expected_type) => {
+                    let accepts_value = if allow_none {
+                        Self::django_model_init_accepts_value(
+                            self.db(),
+                            actual_type,
+                            expected_type,
+                            current_method_instance,
+                        )
+                    } else {
+                        Self::django_lookup_accepts_value(
+                            self.db(),
+                            actual_type,
+                            expected_type,
+                            current_method_instance,
+                        )
+                    };
+                    if accepts_value
+                        || Self::is_django_expression_like(self.db(), actual_type)
+                        || Self::is_enum_literal(actual_type)
+                    {
+                        continue;
+                    }
+                    let Some(builder) = self
+                        .context
+                        .report_lint(&INVALID_ARGUMENT_TYPE, &keyword.value)
+                    else {
+                        continue;
+                    };
+                    builder
+                        .into_diagnostic(format_args!(
+                            "Incompatible type for Django {method_name} argument `{field_name}`"
+                        ))
+                        .set_primary_message(format_args!(
+                            "Expected `{}`, found `{}`",
+                            expected_type.display(self.db()),
+                            actual_type.display(self.db())
+                        ));
+                }
+                DjangoLookupExpectedType::UnknownField => {
+                    if let Some(model_class) = static_class_from_instance(self.db(), model_instance)
+                        && let Some(expected_type) =
+                            self.django_model_writable_property_type(model_class, field_name)
+                    {
+                        let accepts_value = if allow_none {
+                            Self::django_model_init_accepts_value(
+                                self.db(),
+                                actual_type,
+                                expected_type,
+                                current_method_instance,
+                            )
+                        } else {
+                            Self::django_lookup_accepts_value(
+                                self.db(),
+                                actual_type,
+                                expected_type,
+                                current_method_instance,
+                            )
+                        };
+                        if accepts_value {
+                            continue;
+                        }
+
+                        let Some(builder) = self
+                            .context
+                            .report_lint(&INVALID_ARGUMENT_TYPE, &keyword.value)
+                        else {
+                            continue;
+                        };
+                        builder
+                            .into_diagnostic(format_args!(
+                                "Incompatible type for Django {method_name} argument `{field_name}`"
+                            ))
+                            .set_primary_message(format_args!(
+                                "Expected `{}`, found `{}`",
+                                expected_type.display(self.db()),
+                                actual_type.display(self.db())
+                            ));
+                        continue;
+                    }
+
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, &keyword.value)
+                    else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                        "Django {method_name} argument `{field_name}` does not match any known model field"
+                    ));
+                }
+                DjangoLookupExpectedType::Dynamic => {}
+            }
+        }
+    }
+
+    fn check_django_model_init_call(
+        &mut self,
+        class: Option<ClassType<'db>>,
+        call_expression: &ast::ExprCall,
+        current_method_instance: Option<Type<'db>>,
+    ) {
+        let Some((model_class, _)) = class.and_then(|class| class.static_class_literal(self.db()))
+        else {
+            return;
+        };
+        if !model_class.is_django_model(self.db())
+            || model_class.is_known(self.db(), KnownClass::DjangoModel)
+        {
+            return;
+        }
+
+        let model_instance = Type::instance(
+            self.db(),
+            model_class.apply_optional_specialization(self.db(), None),
+        );
+
+        if let Some(field_names) =
+            django_model_init_positional_field_names(self.db(), model_instance)
+        {
+            for (index, arg) in call_expression.arguments.args.iter().enumerate() {
+                if matches!(arg, ast::Expr::Starred(_)) {
+                    continue;
+                }
+                let Some(field_name) = field_names.get(index) else {
+                    let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, arg) else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                        "Too many positional arguments for Django model `{}`",
+                        model_class.name(self.db())
+                    ));
+                    continue;
+                };
+                let actual_type = self.expression_type(arg);
+                match self
+                    .django_lookup_expected_type_for_model(model_instance, field_name.as_str())
+                {
+                    DjangoLookupExpectedType::Expected(expected_type) => {
+                        if Self::django_lookup_accepts_value(
+                            self.db(),
+                            actual_type,
+                            expected_type,
+                            current_method_instance,
+                        ) || Self::is_django_expression_like(self.db(), actual_type)
+                            || Self::is_enum_literal(actual_type)
+                        {
+                            continue;
+                        }
+                        let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, arg)
+                        else {
+                            continue;
+                        };
+                        builder
+                            .into_diagnostic(format_args!(
+                                "Incompatible type for Django model field `{field_name}`"
+                            ))
+                            .set_primary_message(format_args!(
+                                "Expected `{}`, found `{}`",
+                                expected_type.display(self.db()),
+                                actual_type.display(self.db())
+                            ));
+                    }
+                    DjangoLookupExpectedType::UnknownField | DjangoLookupExpectedType::Dynamic => {}
+                }
+            }
+        }
+
+        self.check_django_create_field_kwargs(
+            "model initialization",
+            model_instance,
+            call_expression,
+            current_method_instance,
+            true,
+        );
+    }
+
+    fn literal_string_collection_items<'expr>(
+        expr: &'expr ast::Expr,
+    ) -> Option<(&'expr [ast::Expr], bool)> {
+        match expr {
+            ast::Expr::List(ast::ExprList { elts, .. })
+            | ast::Expr::Tuple(ast::ExprTuple { elts, .. })
+            | ast::Expr::Set(ast::ExprSet { elts, .. }) => Some((elts, elts.is_empty())),
+            _ => None,
+        }
+    }
+
+    fn check_django_bulk_field_name(
+        &mut self,
+        method_name: &str,
+        model_instance: Type<'db>,
+        field_name: &str,
+        field_expr: &ast::Expr,
+        allow_primary_key: bool,
+    ) {
+        match django_bulk_field_lookup(self.db(), model_instance, field_name, allow_primary_key) {
+            DjangoBulkFieldLookup::Valid => {}
+            DjangoBulkFieldLookup::UnknownField => {
+                let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, field_expr) else {
+                    return;
+                };
+                builder.into_diagnostic(format_args!(
+                    "Django {method_name} field `{field_name}` does not match any known model field"
+                ));
+            }
+            DjangoBulkFieldLookup::PrimaryKey => {
+                let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, field_expr)
+                else {
+                    return;
+                };
+                builder.into_diagnostic(format_args!(
+                    "Django {method_name} does not support primary key field `{field_name}`"
+                ));
+            }
+            DjangoBulkFieldLookup::NonConcrete => {
+                let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, field_expr)
+                else {
+                    return;
+                };
+                builder.into_diagnostic(format_args!(
+                    "Django {method_name} field `{field_name}` is not concrete"
+                ));
+            }
+        }
+    }
+
+    fn check_django_bulk_field_collection(
+        &mut self,
+        method_name: &str,
+        model_instance: Type<'db>,
+        collection_expr: &ast::Expr,
+        allow_primary_key: bool,
+        require_non_empty: bool,
+    ) {
+        let Some((items, is_empty)) = Self::literal_string_collection_items(collection_expr) else {
+            return;
+        };
+
+        if is_empty && require_non_empty {
+            let Some(builder) = self
+                .context
+                .report_lint(&INVALID_ARGUMENT_TYPE, collection_expr)
+            else {
+                return;
+            };
+            builder.into_diagnostic(format_args!(
+                "Field names must be given to Django {method_name}"
+            ));
+            return;
+        }
+
+        for item in items {
+            let ast::Expr::StringLiteral(string_literal) = item else {
+                continue;
+            };
+            self.check_django_bulk_field_name(
+                method_name,
+                model_instance,
+                string_literal.value.to_str(),
+                item,
+                allow_primary_key,
+            );
+        }
+    }
+
+    fn check_django_bulk_create_keyword_collection(
+        &mut self,
+        method_name: &str,
+        model_instance: Type<'db>,
+        call_expression: &ast::ExprCall,
+        keyword_name: &str,
+        allow_primary_key: bool,
+    ) {
+        let Some(keyword) = call_expression
+            .arguments
+            .keywords
+            .iter()
+            .find(|keyword| keyword.arg.as_deref() == Some(keyword_name))
+        else {
+            return;
+        };
+
+        self.check_django_bulk_field_collection(
+            method_name,
+            model_instance,
+            &keyword.value,
+            allow_primary_key,
+            false,
+        );
+    }
+
+    fn check_django_bulk_field_names(
+        &mut self,
+        method_name: &str,
+        model_instance: Type<'db>,
+        call_expression: &ast::ExprCall,
+    ) {
+        match method_name {
+            "bulk_update" | "abulk_update" => {
+                if let Some(fields_arg) = call_expression.arguments.args.get(1) {
+                    self.check_django_bulk_field_collection(
+                        method_name,
+                        model_instance,
+                        fields_arg,
+                        false,
+                        true,
+                    );
+                }
+            }
+            "bulk_create" | "abulk_create" => {
+                if let Some(update_fields_arg) = call_expression.arguments.args.get(4) {
+                    self.check_django_bulk_field_collection(
+                        method_name,
+                        model_instance,
+                        update_fields_arg,
+                        false,
+                        false,
+                    );
+                }
+                if let Some(unique_fields_arg) = call_expression.arguments.args.get(5) {
+                    self.check_django_bulk_field_collection(
+                        method_name,
+                        model_instance,
+                        unique_fields_arg,
+                        true,
+                        false,
+                    );
+                }
+                self.check_django_bulk_create_keyword_collection(
+                    method_name,
+                    model_instance,
+                    call_expression,
+                    "update_fields",
+                    false,
+                );
+                self.check_django_bulk_create_keyword_collection(
+                    method_name,
+                    model_instance,
+                    call_expression,
+                    "unique_fields",
+                    true,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn django_named_values_list_row_type(
+        &self,
+        call_expression: &ast::ExprCall,
+        columns: Vec<(Name, Type<'db>)>,
+    ) -> Type<'db> {
+        let fields = columns
+            .into_iter()
+            .map(|(name, ty)| NamedTupleField {
+                name,
+                ty,
+                default: None,
+                definition: None,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let spec = NamedTupleSpec::known(self.db(), fields);
+        let call_node_index = call_expression.node_index.load();
+        let scope = self.scope();
+        let scope_anchor = scope
+            .node(self.db())
+            .node_index()
+            .unwrap_or(ast::NodeIndex::from(0));
+        let anchor_u32 = scope_anchor
+            .as_u32()
+            .expect("scope anchor should not be NodeIndex::NONE");
+        let call_u32 = call_node_index
+            .as_u32()
+            .expect("call node should not be NodeIndex::NONE");
+        let namedtuple = DynamicNamedTupleLiteral::new(
+            self.db(),
+            Name::new_static("Row"),
+            DynamicNamedTupleAnchor::ScopeOffset {
+                scope,
+                offset: call_u32 - anchor_u32,
+                spec,
+            },
+        );
+
+        namedtuple.to_instance(self.db())
+    }
+
+    fn django_queryset_row_type_for_values_list_call(
+        &self,
+        callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let Type::BoundMethod(bound_method) = callable_type else {
+            return None;
+        };
+        if bound_method.function(self.db()).name(self.db()).as_str() != "values_list" {
+            return None;
+        }
+
+        let flat = call_expression
+            .arguments
+            .keywords
+            .iter()
+            .find(|keyword| keyword.arg.as_deref() == Some("flat"))
+            .and_then(|keyword| match &keyword.value {
+                ast::Expr::BooleanLiteral(literal) => Some(literal.value),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let named = call_expression
+            .arguments
+            .keywords
+            .iter()
+            .find(|keyword| keyword.arg.as_deref() == Some("named"))
+            .and_then(|keyword| match &keyword.value {
+                ast::Expr::BooleanLiteral(literal) => Some(literal.value),
+                _ => None,
+            })
+            .unwrap_or(false);
+
+        if flat && named {
+            let Some(builder) = self
+                .context
+                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
+            else {
+                return None;
+            };
+            builder.into_diagnostic("Django values_list cannot use `flat=True` with `named=True`");
+            return None;
+        }
+
+        let args = &call_expression.arguments.args;
+        if flat && args.len() > 1 {
+            let Some(builder) = self
+                .context
+                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
+            else {
+                return None;
+            };
+            builder
+                .into_diagnostic("Django values_list with `flat=True` requires exactly one field");
+            return None;
+        }
+
+        let model_instance = model_instance_from_django_queryset_like(
+            self.db(),
+            bound_method.self_instance(self.db()),
+        )?;
+
+        let row_ty = if args.is_empty() {
+            if named {
+                let columns = django_values_list_all_fields_columns(self.db(), model_instance)?;
+                self.django_named_values_list_row_type(call_expression, columns)
+            } else {
+                django_values_list_all_fields_row_type(self.db(), model_instance, flat)?
+            }
+        } else {
+            let mut columns = Vec::with_capacity(args.len());
+            for arg in args {
+                let ast::Expr::StringLiteral(string_literal) = arg else {
+                    return None;
+                };
+                let field_name = string_literal.value.to_str();
+                let DjangoLookupExpectedType::Expected(row_ty) =
+                    self.django_lookup_expected_type_for_model(model_instance, field_name)
+                else {
+                    return None;
+                };
+                columns.push((Name::new(field_name), row_ty));
+            }
+
+            if flat {
+                let row_types = columns
+                    .iter()
+                    .map(|(_, row_ty)| *row_ty)
+                    .collect::<Vec<_>>();
+                let [row_ty] = row_types.as_slice() else {
+                    let Some(builder) = self
+                        .context
+                        .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
+                    else {
+                        return None;
+                    };
+                    builder.into_diagnostic(
+                        "Django values_list with `flat=True` requires exactly one field",
+                    );
+                    return None;
+                };
+                *row_ty
+            } else if named {
+                self.django_named_values_list_row_type(call_expression, columns)
+            } else {
+                let row_types = columns.into_iter().map(|(_, row_ty)| row_ty);
+                Type::heterogeneous_tuple(self.db(), row_types)
+            }
+        };
+
+        if flat && named {
+            let Some(builder) = self
+                .context
+                .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
+            else {
+                return None;
+            };
+            builder.into_diagnostic("Django values_list cannot use `flat=True` with `named=True`");
+            return None;
+        }
+
+        django_queryset_with_row_type(self.db(), return_ty, row_ty)
+    }
+
+    fn django_queryset_row_type_for_values_call(
+        &self,
+        callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let Type::BoundMethod(bound_method) = callable_type else {
+            return None;
+        };
+        if bound_method.function(self.db()).name(self.db()).as_str() != "values" {
+            return None;
+        }
+
+        let model_instance = model_instance_from_django_queryset_like(
+            self.db(),
+            bound_method.self_instance(self.db()),
+        )?;
+
+        let row_ty = if call_expression.arguments.args.is_empty()
+            && call_expression.arguments.keywords.is_empty()
+        {
+            django_values_all_fields_row_type(self.db(), model_instance)?
+        } else {
+            let mut items = TypedDictSchema::default();
+            for arg in &call_expression.arguments.args {
+                let ast::Expr::StringLiteral(string_literal) = arg else {
+                    return None;
+                };
+                let field_name = string_literal.value.to_str();
+                let DjangoLookupExpectedType::Expected(field_ty) =
+                    self.django_lookup_expected_type_for_model(model_instance, field_name)
+                else {
+                    return None;
+                };
+                items.insert(
+                    Name::new(field_name),
+                    functional_typed_dict_field(field_ty, TypeQualifiers::empty(), true),
+                );
+            }
+            for keyword in &call_expression.arguments.keywords {
+                let Some(keyword_name) = keyword.arg.as_ref() else {
+                    return None;
+                };
+                items.insert(
+                    Name::new(keyword_name.as_str()),
+                    functional_typed_dict_field(
+                        self.expression_type(&keyword.value),
+                        TypeQualifiers::empty(),
+                        true,
+                    ),
+                );
+            }
+
+            Type::TypedDict(TypedDictType::from_schema_items(self.db(), items))
+        };
+
+        django_queryset_with_row_type(self.db(), return_ty, row_ty)
+    }
+
+    fn django_aggregate_class_name(&self, ty: Type<'db>) -> Option<&'db str> {
+        let class = ty.nominal_class(self.db())?;
+        let mut class_name = None;
+        let mut is_aggregate = false;
+
+        for base in class
+            .iter_mro(self.db())
+            .filter_map(|base| base.into_class())
+            .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
+        {
+            if class_name.is_none() {
+                class_name = Some(base.name(self.db()).as_str());
+            }
+            if base.name(self.db()).as_str() == "Aggregate" {
+                is_aggregate = true;
+            }
+        }
+
+        is_aggregate
+            .then_some(class_name?)
+            .filter(|name| *name != "Aggregate")
+    }
+
+    fn django_aggregate_default_alias(&self, expr: &ast::Expr) -> Option<Name> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        let aggregate_name = self.django_aggregate_class_name(self.expression_type(expr))?;
+
+        let [source] = call.arguments.args.as_ref() else {
+            return None;
+        };
+        let ast::Expr::StringLiteral(source) = source else {
+            return None;
+        };
+
+        Some(Name::new(format!(
+            "{}__{}",
+            source.value.to_str(),
+            aggregate_name.to_ascii_lowercase()
+        )))
+    }
+
+    fn django_aggregate_output_type(
+        &self,
+        model_instance: Type<'db>,
+        expr: &ast::Expr,
+    ) -> Type<'db> {
+        let expr_ty = self.expression_type(expr);
+        let Some(aggregate_name) = self.django_aggregate_class_name(expr_ty) else {
+            return expr_ty;
+        };
+
+        match aggregate_name {
+            "Count" => KnownClass::Int.to_instance(self.db()),
+            "Avg" | "StdDev" | "Variance" => KnownClass::Float.to_instance(self.db()),
+            "Max" | "Min" | "Sum" => {
+                let ast::Expr::Call(call) = expr else {
+                    return Type::unknown();
+                };
+                let Some(ast::Expr::StringLiteral(source)) = call.arguments.args.first() else {
+                    return Type::unknown();
+                };
+                match self
+                    .django_lookup_expected_type_for_model(model_instance, source.value.to_str())
+                {
+                    DjangoLookupExpectedType::Expected(source_ty) => source_ty,
+                    DjangoLookupExpectedType::UnknownField | DjangoLookupExpectedType::Dynamic => {
+                        Type::unknown()
+                    }
+                }
+            }
+            _ => Type::unknown(),
+        }
+    }
+
+    fn django_f_expression_output_type(
+        &self,
+        model_instance: Type<'db>,
+        expr: &ast::Expr,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        let expr_ty = self.expression_type(expr);
+        let is_f_expression =
+            self.django_expression_type_or_call_name_matches(expr_ty, expr, &["F"]);
+        if !is_f_expression {
+            return None;
+        }
+
+        let Some(ast::Expr::StringLiteral(field_name)) = call.arguments.args.first() else {
+            return None;
+        };
+        match self.django_lookup_expected_type_for_model(model_instance, field_name.value.to_str())
+        {
+            DjangoLookupExpectedType::Expected(field_ty) => Some(field_ty),
+            DjangoLookupExpectedType::UnknownField | DjangoLookupExpectedType::Dynamic => None,
+        }
+    }
+
+    fn django_value_expression_output_type(&self, expr: &ast::Expr) -> Option<Type<'db>> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        let expr_ty = self.expression_type(expr);
+        let is_value_expression =
+            self.django_expression_type_or_call_name_matches(expr_ty, expr, &["Value"]);
+        if !is_value_expression {
+            return None;
+        }
+
+        call.arguments.args.first().map(|value| {
+            let value_ty = self.expression_type(value);
+            if value_ty.is_unknown() {
+                Self::django_literal_expression_type(self.db(), value).unwrap_or(value_ty)
+            } else {
+                value_ty
+            }
+        })
+    }
+
+    fn django_literal_expression_type(db: &'db dyn Db, expr: &ast::Expr) -> Option<Type<'db>> {
+        match expr {
+            ast::Expr::StringLiteral(literal)
+                if literal.value.len() <= Self::MAX_STRING_LITERAL_SIZE =>
+            {
+                Some(Type::string_literal(db, literal.value.to_str()))
+            }
+            ast::Expr::StringLiteral(_) => Some(Type::literal_string()),
+            ast::Expr::NumberLiteral(literal) => match &literal.value {
+                ast::Number::Int(int) => int
+                    .as_i64()
+                    .map(Type::int_literal)
+                    .or_else(|| Some(KnownClass::Int.to_instance(db))),
+                ast::Number::Float(_) => Some(KnownClass::Float.to_instance(db)),
+                ast::Number::Complex { .. } => Some(KnownClass::Complex.to_instance(db)),
+            },
+            ast::Expr::BooleanLiteral(literal) => Some(Type::bool_literal(literal.value)),
+            ast::Expr::NoneLiteral(_) => Some(Type::none(db)),
+            _ => None,
+        }
+    }
+
+    fn django_output_field_type_from_name(&self, name: &str) -> Option<Type<'db>> {
+        match name {
+            "CharField" | "EmailField" | "SlugField" | "TextField" | "URLField" => {
+                Some(KnownClass::Str.to_instance(self.db()))
+            }
+            "IntegerField" | "AutoField" | "BigAutoField" | "SmallAutoField" => {
+                Some(KnownClass::Int.to_instance(self.db()))
+            }
+            "FloatField" => Some(KnownClass::Float.to_instance(self.db())),
+            "BooleanField" | "NullBooleanField" => Some(KnownClass::Bool.to_instance(self.db())),
+            "DateField" => Some(resolve_stdlib_instance(
+                self.db(),
+                KnownModule::Datetime,
+                "date",
+            )),
+            "DateTimeField" => Some(resolve_stdlib_instance(
+                self.db(),
+                KnownModule::Datetime,
+                "datetime",
+            )),
+            "TimeField" => Some(resolve_stdlib_instance(
+                self.db(),
+                KnownModule::Datetime,
+                "time",
+            )),
+            "DecimalField" => Some(resolve_stdlib_instance(
+                self.db(),
+                KnownModule::Decimal,
+                "Decimal",
+            )),
+            "UUIDField" => Some(resolve_stdlib_instance(
+                self.db(),
+                KnownModule::Uuid,
+                "UUID",
+            )),
+            "BinaryField" => Some(KnownClass::Bytes.to_instance(self.db())),
+            _ => None,
+        }
+    }
+
+    fn django_output_field_call_name_type(&self, expr: &ast::Expr) -> Option<Type<'db>> {
+        Self::django_call_name(expr).and_then(|name| self.django_output_field_type_from_name(name))
+    }
+
+    fn django_output_field_expression_type(&self, expr: &ast::Expr) -> Option<Type<'db>> {
+        self.django_output_field_call_name_type(expr).or_else(|| {
+            self.django_expression_type_or_call_name(expr)
+                .and_then(|name| self.django_output_field_type_from_name(&name))
+        })
+    }
+
+    fn is_django_annotation_expression_type(&self, ty: Type<'db>) -> bool {
+        ty.nominal_class(self.db()).is_some_and(|class| {
+            class
+                .iter_mro(self.db())
+                .filter_map(|base| base.into_class())
+                .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
+                .any(|base| {
+                    matches!(
+                        base.name(self.db()).as_str(),
+                        "Case"
+                            | "Cast"
+                            | "CombinedExpression"
+                            | "Combinable"
+                            | "Expression"
+                            | "ExpressionWrapper"
+                            | "Func"
+                            | "RawSQL"
+                            | "Subquery"
+                    )
+                })
+        })
+    }
+
+    fn django_expression_type_or_call_name_matches(
+        &self,
+        ty: Type<'db>,
+        expr: &ast::Expr,
+        names: &[&str],
+    ) -> bool {
+        ty.nominal_class(self.db()).is_some_and(|class| {
+            class
+                .iter_mro(self.db())
+                .filter_map(|base| base.into_class())
+                .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
+                .any(|base| names.contains(&base.name(self.db()).as_str()))
+        }) || Self::django_call_name(expr).is_some_and(|name| names.contains(&name))
+    }
+
+    fn django_expression_type_or_call_name(&self, expr: &ast::Expr) -> Option<String> {
+        if let Some(class) = self.expression_type(expr).nominal_class(self.db()) {
+            if let Some(name) = class
+                .iter_mro(self.db())
+                .filter_map(|base| base.into_class())
+                .filter_map(|base| base.static_class_literal(self.db()).map(|(base, _)| base))
+                .map(|base| base.name(self.db()).to_string())
+                .next()
+            {
+                return Some(name);
+            }
+        }
+
+        Self::django_call_name(expr).map(str::to_string)
+    }
+
+    fn django_call_name(expr: &ast::Expr) -> Option<&str> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        match call.func.as_ref() {
+            ast::Expr::Name(name) => Some(name.id.as_str()),
+            ast::Expr::Attribute(attribute) => Some(attribute.attr.as_str()),
+            _ => None,
+        }
+    }
+
+    fn django_expression_output_field_type(&self, expr: &ast::Expr) -> Option<Type<'db>> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        let expr_ty = self.expression_type(expr);
+        if !self.django_expression_type_or_call_name_matches(
+            expr_ty,
+            expr,
+            &[
+                "Case",
+                "Cast",
+                "CombinedExpression",
+                "Combinable",
+                "Expression",
+                "ExpressionWrapper",
+                "Func",
+                "RawSQL",
+                "Subquery",
+            ],
+        ) {
+            return None;
+        }
+
+        call.arguments.keywords.iter().find_map(|keyword| {
+            (keyword.arg.as_deref() == Some("output_field"))
+                .then(|| self.django_output_field_expression_type(&keyword.value))
+                .flatten()
+        })
+    }
+
+    fn django_expression_output_field_member_type(&self, ty: Type<'db>) -> Option<Type<'db>> {
+        match ty {
+            Type::Union(union) => {
+                let elements: Vec<_> = union
+                    .elements(self.db())
+                    .iter()
+                    .filter_map(|element| self.django_expression_output_field_member_type(*element))
+                    .collect();
+                return (!elements.is_empty())
+                    .then(|| UnionType::from_elements(self.db(), elements));
+            }
+            Type::Intersection(intersection) => {
+                if let Some(output_ty) = intersection
+                    .positive(self.db())
+                    .iter()
+                    .find_map(|element| self.django_expression_output_field_member_type(*element))
+                {
+                    return Some(output_ty);
+                }
+            }
+            _ => {}
+        }
+
+        if !self.is_django_annotation_expression_type(ty) {
+            return None;
+        }
+
+        let class = ty.nominal_class(self.db())?;
+        if matches!(
+            class.name(self.db()).as_str(),
+            "Case"
+                | "Cast"
+                | "CombinedExpression"
+                | "Combinable"
+                | "Count"
+                | "Expression"
+                | "ExpressionWrapper"
+                | "F"
+                | "Func"
+                | "Max"
+                | "Min"
+                | "RawSQL"
+                | "Subquery"
+                | "Sum"
+                | "Value"
+        ) {
+            return None;
+        }
+
+        let definition = class.definition(self.db())?;
+        let DefinitionKind::Class(class_node) = definition.kind(self.db()) else {
+            return None;
+        };
+        let module = parsed_module(self.db(), definition.file(self.db())).load(self.db());
+
+        class_node
+            .node(&module)
+            .body
+            .iter()
+            .find_map(|statement| match statement {
+                ast::Stmt::Assign(assign)
+                    if assign.targets.iter().any(Self::is_output_field_name) =>
+                {
+                    self.django_output_field_call_name_type(&assign.value)
+                }
+                ast::Stmt::AnnAssign(assign) if Self::is_output_field_name(&assign.target) => {
+                    assign
+                        .value
+                        .as_deref()
+                        .and_then(|value| self.django_output_field_call_name_type(value))
+                }
+                _ => None,
+            })
+    }
+
+    fn is_output_field_name(expr: &ast::Expr) -> bool {
+        matches!(expr, ast::Expr::Name(name) if name.id.as_str() == "output_field")
+    }
+
+    fn django_case_expression_output_type(
+        &self,
+        model_instance: Type<'db>,
+        expr: &ast::Expr,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Call(call) = expr else {
+            return None;
+        };
+        let expr_ty = self.expression_type(expr);
+        let is_case_expression =
+            self.django_expression_type_or_call_name_matches(expr_ty, expr, &["Case"]);
+        if !is_case_expression {
+            return None;
+        }
+
+        let default_type = call.arguments.keywords.iter().find_map(|keyword| {
+            (keyword.arg.as_deref() == Some("default")).then(|| {
+                self.django_expression_or_field_reference_output_type(
+                    model_instance,
+                    &keyword.value,
+                )
+            })
+        });
+        let when_type = call.arguments.args.iter().find_map(|arg| {
+            let ast::Expr::Call(when_call) = arg else {
+                return None;
+            };
+            let is_when_expression = self.django_expression_type_or_call_name_matches(
+                self.expression_type(arg),
+                arg,
+                &["When"],
+            );
+            if !is_when_expression {
+                return None;
+            }
+
+            when_call.arguments.keywords.iter().find_map(|keyword| {
+                (keyword.arg.as_deref() == Some("then")).then(|| {
+                    self.django_expression_or_field_reference_output_type(
+                        model_instance,
+                        &keyword.value,
+                    )
+                })
+            })
+        });
+
+        self.django_expression_output_field_type(expr)
+            .or(default_type)
+            .or(when_type)
+    }
+
+    fn django_expression_or_field_reference_output_type(
+        &self,
+        model_instance: Type<'db>,
+        expr: &ast::Expr,
+    ) -> Type<'db> {
+        if let ast::Expr::StringLiteral(field_reference) = expr {
+            if let DjangoLookupExpectedType::Expected(field_ty) = self
+                .django_lookup_expected_type_for_model(
+                    model_instance,
+                    field_reference.value.to_str(),
+                )
+            {
+                return field_ty;
+            }
+        }
+
+        self.django_expression_output_type(model_instance, expr)
+    }
+
+    fn django_expression_output_type(
+        &self,
+        model_instance: Type<'db>,
+        expr: &ast::Expr,
+    ) -> Type<'db> {
+        let expr_ty = self.expression_type(expr);
+        self.django_f_expression_output_type(model_instance, expr)
+            .or_else(|| self.django_value_expression_output_type(expr))
+            .or_else(|| self.django_case_expression_output_type(model_instance, expr))
+            .or_else(|| self.django_expression_output_field_type(expr))
+            .unwrap_or_else(|| {
+                let aggregate_ty = self.django_aggregate_output_type(model_instance, expr);
+                if aggregate_ty != expr_ty {
+                    aggregate_ty
+                } else if let Some(output_field_ty) =
+                    self.django_expression_output_field_member_type(expr_ty)
+                {
+                    output_field_ty
+                } else if self.is_django_annotation_expression_type(expr_ty) {
+                    Type::unknown()
+                } else {
+                    expr_ty
+                }
+            })
+    }
+
+    fn django_aggregate_return_type_for_call(
+        &self,
+        callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+    ) -> Option<Type<'db>> {
+        let Type::BoundMethod(bound_method) = callable_type else {
+            return None;
+        };
+        let method_name = bound_method.function(self.db()).name(self.db());
+        if !matches!(method_name.as_str(), "aggregate" | "aaggregate") {
+            return None;
+        }
+
+        let model_instance = model_instance_from_django_queryset_like(
+            self.db(),
+            bound_method.self_instance(self.db()),
+        )?;
+
+        let mut items = TypedDictSchema::default();
+        for arg in &call_expression.arguments.args {
+            let alias = self.django_aggregate_default_alias(arg)?;
+            items.insert(
+                alias,
+                functional_typed_dict_field(
+                    self.django_expression_output_type(model_instance, arg),
+                    TypeQualifiers::empty(),
+                    true,
+                ),
+            );
+        }
+        for keyword in &call_expression.arguments.keywords {
+            let Some(keyword_name) = keyword.arg.as_ref() else {
+                return None;
+            };
+            items.insert(
+                Name::new(keyword_name.as_str()),
+                functional_typed_dict_field(
+                    self.django_expression_output_type(model_instance, &keyword.value),
+                    TypeQualifiers::empty(),
+                    true,
+                ),
+            );
+        }
+
+        if items.is_empty() {
+            return None;
+        }
+
+        let aggregate_ty = Type::TypedDict(TypedDictType::from_schema_items(self.db(), items));
+        if method_name.as_str() == "aaggregate" {
+            Some(
+                KnownClass::CoroutineType
+                    .to_specialized_instance(self.db(), &[Type::any(), Type::any(), aggregate_ty]),
+            )
+        } else {
+            Some(aggregate_ty)
+        }
+    }
+
+    fn django_queryset_model_and_row_type(
+        &self,
+        queryset_ty: Type<'db>,
+    ) -> Option<(Type<'db>, Type<'db>)> {
+        let model_ty = model_instance_from_django_queryset_like(self.db(), queryset_ty)?;
+        let row_ty = queryset_ty
+            .class_specialization(self.db())
+            .and_then(|specialization| specialization.types(self.db()).get(1).copied())
+            .unwrap_or(model_ty);
+        Some((model_ty, row_ty))
+    }
+
+    fn django_queryset_model_and_row_type_for_call_result(
+        &self,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) -> Option<(Type<'db>, Type<'db>)> {
+        self.django_queryset_model_and_row_type(return_ty)
+            .or_else(|| {
+                let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+                    return None;
+                };
+                self.django_queryset_model_and_row_type(self.expression_type(&method_attr.value))
+            })
+    }
+
+    fn django_queryset_return_with_model_and_row_type(
+        &self,
+        return_ty: Type<'db>,
+        model_ty: Type<'db>,
+        row_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        django_queryset_with_model_and_row_type(self.db(), return_ty, model_ty, row_ty).or_else(
+            || {
+                let queryset_base = django_queryset_base_instance_with_model_and_row_type(
+                    self.db(),
+                    self.file(),
+                    model_ty,
+                    row_ty,
+                )?;
+                Some(IntersectionType::from_two_elements(
+                    self.db(),
+                    queryset_base,
+                    return_ty,
+                ))
+            },
+        )
+    }
+
+    fn django_queryset_return_type_for_annotate_call(
+        &self,
+        _callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return None;
+        };
+        if !matches!(method_attr.attr.as_str(), "annotate" | "alias") {
+            return None;
+        }
+
+        let (model_ty, row_ty) =
+            self.django_queryset_model_and_row_type_for_call_result(call_expression, return_ty)?;
+        let selected_fields =
+            Self::django_selected_fields_from_receiver_values_list(call_expression);
+
+        let mut annotation_fields = Vec::new();
+        let mut seen_annotation_names = FxHashSet::default();
+        for arg in &call_expression.arguments.args {
+            let Some(annotation_name) = Self::django_positional_annotation_name(arg) else {
+                continue;
+            };
+            if !seen_annotation_names.insert(annotation_name.clone()) {
+                let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, arg) else {
+                    continue;
+                };
+                builder.into_diagnostic(format_args!(
+                    "Django annotation `{annotation_name}` conflicts with another annotation in the same call"
+                ));
+                continue;
+            }
+            annotation_fields.push((
+                Name::new(annotation_name),
+                self.django_expression_output_type(model_ty, arg),
+            ));
+        }
+        for keyword in &call_expression.arguments.keywords {
+            let mut annotations = Vec::new();
+            if let Some(keyword_name) = keyword.arg.as_ref() {
+                annotations.push((keyword_name.as_str().to_string(), &keyword.value));
+            } else {
+                annotations.extend(self.django_annotation_items_from_splat(&keyword.value));
+            };
+
+            for (annotation_name, annotation_value) in annotations {
+                if !seen_annotation_names.insert(annotation_name.clone()) {
+                    let Some(builder) = self
+                        .context
+                        .report_lint(&INVALID_ARGUMENT_TYPE, annotation_value)
+                    else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                    "Django annotation `{annotation_name}` conflicts with another annotation in the same call"
+                    ));
+                    continue;
+                }
+                let conflicts_with_existing_annotation =
+                    self.django_annotation_protocol_has_member(model_ty, &annotation_name);
+                let conflicts_with_model_field = matches!(
+                    self.django_lookup_expected_type_for_model(model_ty, &annotation_name),
+                    DjangoLookupExpectedType::Expected(_)
+                );
+                if conflicts_with_existing_annotation
+                    || (conflicts_with_model_field
+                        && selected_fields.as_ref().map_or_else(
+                            || {
+                                self.django_selected_row_contains_item(row_ty, &annotation_name)
+                                    .unwrap_or(true)
+                            },
+                            |fields| fields.contains(annotation_name.as_str()),
+                        ))
+                {
+                    let Some(builder) = self
+                        .context
+                        .report_lint(&INVALID_ARGUMENT_TYPE, annotation_value)
+                    else {
+                        continue;
+                    };
+                    builder.into_diagnostic(format_args!(
+                    "Django annotation `{annotation_name}` conflicts with an existing model field or annotation"
+                ));
+                    continue;
+                }
+                annotation_fields.push((
+                    Name::new(&annotation_name),
+                    self.django_expression_output_type(model_ty, annotation_value),
+                ));
+            }
+        }
+        if annotation_fields.is_empty() {
+            return None;
+        }
+
+        let annotation_protocol = Type::protocol_with_readonly_members(
+            self.db(),
+            annotation_fields
+                .iter()
+                .map(|(name, ty)| (name.as_str(), *ty)),
+        );
+        let annotated_model =
+            IntersectionType::from_two_elements(self.db(), model_ty, annotation_protocol);
+        let annotated_row = if row_ty == model_ty {
+            annotated_model
+        } else {
+            row_ty
+        };
+
+        let return_ty = self.django_queryset_return_with_model_and_row_type(
+            return_ty,
+            annotated_model,
+            annotated_row,
+        )?;
+        Some(IntersectionType::from_two_elements(
+            self.db(),
+            return_ty,
+            annotation_protocol,
+        ))
+    }
+
+    fn django_prefetch_string_keyword<'expr>(
+        call: &'expr ast::ExprCall,
+        keyword_name: &str,
+    ) -> Option<&'expr str> {
+        call.arguments
+            .keywords
+            .iter()
+            .find(|keyword| keyword.arg.as_deref() == Some(keyword_name))
+            .and_then(|keyword| match &keyword.value {
+                ast::Expr::StringLiteral(string_literal) => Some(string_literal.value.to_str()),
+                _ => None,
+            })
+    }
+
+    fn is_django_generic_prefetch_call(call: &ast::ExprCall) -> bool {
+        match call.func.as_ref() {
+            ast::Expr::Name(name) => name.id.as_str() == "GenericPrefetch",
+            ast::Expr::Attribute(attribute) => attribute.attr.as_str() == "GenericPrefetch",
+            _ => false,
+        }
+    }
+
+    fn django_prefetch_queryset_expression<'expr>(
+        call: &'expr ast::ExprCall,
+    ) -> Option<&'expr ast::Expr> {
+        call.arguments
+            .keywords
+            .iter()
+            .find(|keyword| keyword.arg.as_deref() == Some("queryset"))
+            .map(|keyword| &keyword.value)
+            .or_else(|| call.arguments.args.get(1))
+    }
+
+    fn django_prefetch_to_attr_fields(
+        &self,
+        model_instance: Type<'db>,
+        row_ty: Type<'db>,
+        call_expression: &ast::ExprCall,
+    ) -> Vec<(Name, Type<'db>)> {
+        let mut prefetch_fields = Vec::new();
+        let mut seen_to_attrs = FxHashSet::default();
+        let selected_fields =
+            Self::django_selected_fields_from_receiver_values_list(call_expression);
+        for arg in &call_expression.arguments.args {
+            let ast::Expr::Call(prefetch_call) = arg else {
+                continue;
+            };
+
+            let Some(to_attr) = Self::django_prefetch_string_keyword(prefetch_call, "to_attr")
+            else {
+                continue;
+            };
+
+            let conflicts_with_current_prefetch = !seen_to_attrs.insert(to_attr);
+            let conflicts_with_existing_annotation =
+                self.django_annotation_protocol_has_member(model_instance, to_attr);
+            let conflicts_with_model_field = matches!(
+                self.django_lookup_expected_type_for_model(model_instance, to_attr),
+                DjangoLookupExpectedType::Expected(_)
+            );
+            if conflicts_with_current_prefetch
+                || conflicts_with_existing_annotation
+                || (conflicts_with_model_field
+                    && selected_fields.as_ref().map_or_else(
+                        || {
+                            self.django_selected_row_contains_item(row_ty, to_attr)
+                                .unwrap_or(true)
+                        },
+                        |fields| fields.contains(to_attr),
+                    ))
+            {
+                let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, arg) else {
+                    continue;
+                };
+                builder.into_diagnostic(format_args!(
+                    "Django prefetch attribute `{to_attr}` conflicts with an existing model field or annotation"
+                ));
+                continue;
+            }
+
+            let lookup = prefetch_call
+                .arguments
+                .args
+                .first()
+                .and_then(|lookup| match lookup {
+                    ast::Expr::StringLiteral(string_literal) => Some(string_literal.value.to_str()),
+                    _ => None,
+                })
+                .or_else(|| Self::django_prefetch_string_keyword(prefetch_call, "lookup"));
+            if lookup.is_some_and(|lookup| lookup.contains("__")) {
+                continue;
+            }
+
+            let elem_ty = Self::django_prefetch_queryset_expression(prefetch_call)
+                .and_then(|queryset| {
+                    model_instance_from_django_queryset_like(
+                        self.db(),
+                        self.expression_type(queryset),
+                    )
+                })
+                .or_else(|| {
+                    lookup.and_then(|lookup| {
+                        django_prefetch_related_model(self.db(), model_instance, lookup)
+                    })
+                })
+                .unwrap_or_else(Type::unknown);
+            prefetch_fields.push((
+                Name::new(to_attr),
+                KnownClass::List.to_specialized_instance(self.db(), &[elem_ty]),
+            ));
+        }
+        prefetch_fields
+    }
+
+    fn django_queryset_return_type_for_prefetch_related_call(
+        &self,
+        _callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return None;
+        };
+        if method_attr.attr.as_str() != "prefetch_related" {
+            return None;
+        }
+
+        let (model_ty, row_ty) =
+            self.django_queryset_model_and_row_type_for_call_result(call_expression, return_ty)?;
+        let prefetch_fields =
+            self.django_prefetch_to_attr_fields(model_ty, row_ty, call_expression);
+        if prefetch_fields.is_empty() {
+            return None;
+        }
+
+        let annotation_protocol = Type::protocol_with_readonly_members(
+            self.db(),
+            prefetch_fields
+                .iter()
+                .map(|(name, ty)| (name.as_str(), *ty)),
+        );
+        let annotated_model =
+            IntersectionType::from_two_elements(self.db(), model_ty, annotation_protocol);
+        let annotated_row = if row_ty == model_ty {
+            annotated_model
+        } else {
+            row_ty
+        };
+
+        self.django_queryset_return_with_model_and_row_type(
+            return_ty,
+            annotated_model,
+            annotated_row,
+        )
+    }
+
+    fn django_queryset_return_type_preserving_receiver_model(
+        &self,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return None;
+        };
+        if !django_queryset_method_may_return_receiver_model(method_attr.attr.as_str())
+            && self.django_queryset_model_and_row_type(return_ty).is_none()
+            && !Self::django_return_type_may_contain_model(return_ty, self.db())
+        {
+            return None;
+        }
+
+        let receiver_ty = self.expression_type(&method_attr.value);
+        let (receiver_model_ty, receiver_row_ty) =
+            self.django_queryset_model_and_row_type(receiver_ty)?;
+        let receiver_model_class = static_class_from_instance(self.db(), receiver_model_ty)?;
+        let nominal_receiver_model_ty = Type::instance(
+            self.db(),
+            receiver_model_class.default_specialization(self.db()),
+        );
+
+        if receiver_model_ty == nominal_receiver_model_ty {
+            return None;
+        }
+
+        self.django_replace_model_in_queryset_method_return(
+            return_ty,
+            receiver_model_class,
+            receiver_model_ty,
+            receiver_row_ty,
+        )
+    }
+
+    fn django_replace_model_in_queryset_method_return(
+        &self,
+        return_ty: Type<'db>,
+        receiver_model_class: StaticClassLiteral<'db>,
+        receiver_model_ty: Type<'db>,
+        receiver_row_ty: Type<'db>,
+    ) -> Option<Type<'db>> {
+        if static_class_from_instance(self.db(), return_ty) == Some(receiver_model_class) {
+            return Some(receiver_model_ty);
+        }
+
+        if let Some((return_model_ty, return_row_ty)) =
+            self.django_queryset_model_and_row_type(return_ty)
+            && static_class_from_instance(self.db(), return_model_ty) == Some(receiver_model_class)
+        {
+            let row_ty = if return_row_ty == return_model_ty {
+                receiver_model_ty
+            } else {
+                receiver_row_ty
+            };
+            return self.django_queryset_return_with_model_and_row_type(
+                return_ty,
+                receiver_model_ty,
+                row_ty,
+            );
+        }
+
+        let Type::Union(union) = return_ty else {
+            return None;
+        };
+
+        let mut changed = false;
+        let elements: Vec<_> = union
+            .elements(self.db())
+            .iter()
+            .map(|element| {
+                self.django_replace_model_in_queryset_method_return(
+                    *element,
+                    receiver_model_class,
+                    receiver_model_ty,
+                    receiver_row_ty,
+                )
+                .map_or(*element, |replacement| {
+                    changed = true;
+                    replacement
+                })
+            })
+            .collect();
+
+        changed.then(|| UnionType::from_elements(self.db(), elements))
+    }
+
+    fn django_return_type_may_contain_model(return_ty: Type<'db>, db: &'db dyn Db) -> bool {
+        match return_ty {
+            Type::Union(union) => union
+                .elements(db)
+                .iter()
+                .any(|element| Self::django_return_type_may_contain_model(*element, db)),
+            _ => static_class_from_instance(db, return_ty)
+                .is_some_and(|class| class.is_django_model(db)),
+        }
+    }
+
+    fn django_queryset_return_type_for_manager_method_call(
+        &self,
+        call_expression: &ast::ExprCall,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return None;
+        };
+        let method_name = method_attr.attr.as_str();
+        if !django_manager_method_returns_queryset(method_name) {
+            return None;
+        }
+
+        let receiver_ty = self.expression_type(&method_attr.value);
+        if is_django_queryset_instance(self.db(), receiver_ty) {
+            return Some(receiver_ty);
+        }
+
+        let ast::Expr::Attribute(manager_attr) = method_attr.value.as_ref() else {
+            return None;
+        };
+        let member_name = manager_attr.attr.as_str();
+        let owner_ty = self.expression_type(&manager_attr.value);
+
+        if let Type::ClassLiteral(ClassLiteral::Static(model_class)) = owner_ty {
+            return django_queryset_instance_for_model_manager(self.db(), model_class, member_name);
+        }
+
+        let model_class = static_class_from_instance(self.db(), owner_ty)?;
+        django_queryset_instance_for_reverse_manager(self.db(), model_class, member_name)
+    }
+
+    fn is_django_manager_from_queryset_call(&self, call_expression: &ast::ExprCall) -> bool {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return false;
+        };
+        if method_attr.attr.as_str() != "from_queryset" {
+            return false;
+        }
+
+        let Some(queryset_arg) = call_expression.arguments.args.first() else {
+            return false;
+        };
+        let Type::ClassLiteral(ClassLiteral::Static(queryset_class)) =
+            self.expression_type(queryset_arg)
+        else {
+            return false;
+        };
+
+        is_django_queryset_class(self.db(), queryset_class)
+    }
+
+    fn django_meta_get_field_return_type_for_call(
+        &self,
+        call_expression: &ast::ExprCall,
+    ) -> Option<Type<'db>> {
+        let (field_arg, model_owner_ty, field_name) =
+            self.django_meta_get_field_call_parts(call_expression)?;
+
+        if django_meta_has_field(self.db(), model_owner_ty, field_name.value.to_str())
+            == Some(false)
+        {
+            let Some(builder) = self.context.report_lint(&UNKNOWN_ARGUMENT, field_arg) else {
+                return None;
+            };
+            builder.into_diagnostic(format_args!(
+                "Django model field `{}` does not exist",
+                field_name.value.to_str()
+            ));
+            return None;
+        }
+
+        django_meta_get_field_return_type(
+            self.db(),
+            self.file(),
+            model_owner_ty,
+            field_name.value.to_str(),
+        )
+    }
+
+    fn django_meta_get_field_call_parts<'expr>(
+        &self,
+        call_expression: &'expr ast::ExprCall,
+    ) -> Option<(&'expr ast::Expr, Type<'db>, &'expr ast::ExprStringLiteral)> {
+        let ast::Expr::Attribute(method_attr) = call_expression.func.as_ref() else {
+            return None;
+        };
+        if method_attr.attr.as_str() != "get_field" {
+            return None;
+        }
+
+        let ast::Expr::Attribute(meta_attr) = method_attr.value.as_ref() else {
+            return None;
+        };
+        if meta_attr.attr.as_str() != "_meta" {
+            return None;
+        }
+
+        let field_arg = call_expression.arguments.args.first().or_else(|| {
+            call_expression
+                .arguments
+                .keywords
+                .iter()
+                .find_map(|keyword| {
+                    (keyword.arg.as_deref() == Some("field_name")).then_some(&keyword.value)
+                })
+        })?;
+        let ast::Expr::StringLiteral(field_name) = field_arg else {
+            return None;
+        };
+        let model_owner_ty = self.expression_type(&meta_attr.value);
+        Some((field_arg, model_owner_ty, field_name))
+    }
+
+    fn django_get_user_model_return_type_for_call(
+        &self,
+        callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+    ) -> Option<Type<'db>> {
+        let is_django_get_user_model = match callable_type {
+            Type::FunctionLiteral(function)
+                if function.name(self.db()).as_str() == "get_user_model" =>
+            {
+                file_to_module(self.db(), function.file(self.db())).is_some_and(|module| {
+                    module
+                        .name(self.db())
+                        .as_str()
+                        .starts_with("django.contrib.auth")
+                })
+            }
+            _ => {
+                matches!(
+                    call_expression.func.as_ref(),
+                    ast::Expr::Name(name) if name.id.as_str() == "get_user_model"
+                ) && source_text(self.db(), self.file())
+                    .contains("from django.contrib.auth import get_user_model")
+            }
+        };
+        if !is_django_get_user_model {
+            return None;
+        }
+
+        Some(resolve_auth_user_model_reference(self.db(), self.file()))
+    }
+
+    fn check_django_querydict_is_mutable(
+        &self,
+        callable_type: Type<'db>,
+        call_expression: &ast::ExprCall,
+        return_ty: Type<'db>,
+    ) {
+        let Type::BoundMethod(bound_method) = callable_type else {
+            return;
+        };
+        if !return_ty.is_never()
+            || !is_django_querydict_instance(self.db(), bound_method.self_instance(self.db()))
+        {
+            return;
+        }
+
+        let Some(builder) = self
+            .context
+            .report_lint(&INVALID_ARGUMENT_TYPE, call_expression)
+        else {
+            return;
+        };
+        builder.into_diagnostic("This QueryDict is immutable.");
+    }
+
     fn infer_call_expression_impl(
         &mut self,
         call_expression: &ast::ExprCall,
@@ -7523,10 +10338,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut bindings = match bindings_result {
             Ok(()) => bindings,
             Err(_) => {
-                bindings.report_diagnostics(&self.context, call_expression.into());
+                if !self.is_django_manager_from_queryset_call(call_expression) {
+                    bindings.report_diagnostics(&self.context, call_expression.into());
+                }
                 return bindings.return_type(self.db());
             }
         };
+
+        self.check_django_queryset_lookup_call(callable_type, call_expression);
+        let current_method_instance = self
+            .class_context_of_current_method()
+            .map(|class| Type::instance(self.db(), class));
+        self.check_django_model_init_call(class, call_expression, current_method_instance);
 
         for binding in bindings.iter_flat_mut() {
             let binding_type = binding.callable_type;
@@ -7577,7 +10400,47 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let db = self.db();
         let scope = self.scope();
-        let return_ty = bindings.return_type(db);
+        let return_ty = self
+            .django_meta_get_field_return_type_for_call(call_expression)
+            .or_else(|| {
+                self.django_get_user_model_return_type_for_call(callable_type, call_expression)
+            })
+            .or_else(|| self.django_queryset_return_type_for_manager_method_call(call_expression))
+            .or_else(|| self.django_aggregate_return_type_for_call(callable_type, call_expression))
+            .unwrap_or_else(|| bindings.return_type(db));
+        let return_ty = self
+            .django_queryset_return_type_preserving_receiver_model(call_expression, return_ty)
+            .unwrap_or(return_ty);
+        let return_ty = self
+            .django_queryset_return_type_for_annotate_call(
+                callable_type,
+                call_expression,
+                return_ty,
+            )
+            .unwrap_or(return_ty);
+        let return_ty = self
+            .django_queryset_return_type_for_prefetch_related_call(
+                callable_type,
+                call_expression,
+                return_ty,
+            )
+            .unwrap_or(return_ty);
+        let return_ty = self
+            .django_queryset_row_type_for_values_list_call(
+                callable_type,
+                call_expression,
+                return_ty,
+            )
+            .or_else(|| {
+                self.django_queryset_row_type_for_values_call(
+                    callable_type,
+                    call_expression,
+                    return_ty,
+                )
+            })
+            .unwrap_or(return_ty);
+
+        self.check_django_querydict_is_mutable(callable_type, call_expression, return_ty);
 
         let find_narrowed_place = |argument_index: usize| match arguments.args.get(argument_index) {
             None => {
@@ -8516,6 +11379,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             value_type = Type::TypeVar(bound_typevar);
         }
 
+        if django_attribute_base_may_be_settings(value)
+            && let Some(settings_member_ty) =
+                django_settings_member_type(db, self.file(), value_type, &attr.id)
+        {
+            return settings_member_ty;
+        }
+
         let mut assigned_type = None;
         if let Some(place_expr) = PlaceExpr::try_from_expr(attribute) {
             let (resolved, keys) = self.infer_place_load(
@@ -8532,9 +11402,35 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 assigned_type = Some(ty);
             }
         }
-        let fallback_place = value_type.member(db, &attr.id).map_type(|ty| {
+        let mut fallback_place = value_type.member(db, &attr.id).map_type(|ty| {
             self.narrow_expr_with_applicable_constraints(attribute, ty, &constraint_keys)
         });
+
+        if is_django_queryset_or_manager_instance_by_name(db, value_type) {
+            let strict_place = value_type
+                .member_lookup_with_policy(
+                    db,
+                    attr.id.clone(),
+                    MemberLookupPolicy::NO_GETATTR_LOOKUP
+                        | MemberLookupPolicy::MRO_NO_OBJECT_FALLBACK,
+                )
+                .map_type(|ty| {
+                    self.narrow_expr_with_applicable_constraints(attribute, ty, &constraint_keys)
+                });
+
+            let fallback_is_unknown = fallback_place
+                .place
+                .ignore_possibly_undefined()
+                .is_some_and(|ty| ty.is_unknown());
+            let strict_is_unknown = strict_place
+                .place
+                .ignore_possibly_undefined()
+                .is_some_and(|ty| ty.is_unknown());
+
+            if fallback_is_unknown && (strict_place.is_undefined() || strict_is_unknown) {
+                fallback_place = Place::Undefined.with_qualifiers(strict_place.qualifiers);
+            }
+        }
 
         let attr_name = &attr.id;
         let resolved_type =
@@ -10232,6 +13128,33 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
                         .zip(safe_mutable_class.generic_origin(db))
                         .is_some_and(|(l, r)| l == r)
             })
+    }
+}
+
+fn django_queryset_method_may_return_receiver_model(method_name: &str) -> bool {
+    django_manager_method_returns_queryset(method_name)
+        || matches!(
+            method_name,
+            "acreate"
+                | "aearliest"
+                | "afirst"
+                | "aget"
+                | "alast"
+                | "alatest"
+                | "create"
+                | "earliest"
+                | "first"
+                | "get"
+                | "last"
+                | "latest"
+        )
+}
+
+fn django_attribute_base_may_be_settings(value: &ast::Expr) -> bool {
+    match value {
+        ast::Expr::Name(name) => name.id.as_str() == "settings",
+        ast::Expr::Attribute(attribute) => attribute.attr.as_str() == "settings",
+        _ => false,
     }
 }
 

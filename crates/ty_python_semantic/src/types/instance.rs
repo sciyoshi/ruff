@@ -150,7 +150,7 @@ impl<'db> Type<'db> {
     }
 
     /// Synthesize a protocol instance type with a given set of methods.
-    pub(super) fn protocol_with_methods<'a, M>(db: &'db dyn Db, methods: M) -> Self
+    pub(crate) fn protocol_with_methods<'a, M>(db: &'db dyn Db, methods: M) -> Self
     where
         M: IntoIterator<Item = (&'a str, CallableType<'db>)>,
     {

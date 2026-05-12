@@ -9,6 +9,7 @@ use super::TypeInferenceBuilder;
 use crate::place::{DefinedPlace, Definedness, Place};
 use crate::types::call::CallErrorKind;
 use crate::types::call::bind::CallableDescription;
+use crate::types::class::django_model::django_form_declared_field;
 use crate::types::constraints::ConstraintSetBuilder;
 use crate::types::diagnostic::{
     CALL_NON_CALLABLE, INVALID_ARGUMENT_TYPE, INVALID_ASSIGNMENT, INVALID_KEY,
@@ -136,7 +137,38 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return self.infer_explicit_type_alias_specialization(subscript, value_ty, false);
         }
 
+        if let Some(field_ty) = self.infer_django_form_fields_subscript(subscript) {
+            return field_ty;
+        }
+
         self.infer_subscript_load_impl(value_ty, subscript)
+    }
+
+    fn infer_django_form_fields_subscript(
+        &mut self,
+        subscript: &ast::ExprSubscript,
+    ) -> Option<Type<'db>> {
+        let ast::Expr::Attribute(attribute) = subscript.value.as_ref() else {
+            return None;
+        };
+        if attribute.attr.as_str() != "fields" {
+            return None;
+        }
+        let ast::Expr::Name(name) = attribute.value.as_ref() else {
+            return None;
+        };
+        if name.id.as_str() != "self" {
+            return None;
+        }
+        let ast::Expr::StringLiteral(field_name) = subscript.slice.as_ref() else {
+            return None;
+        };
+
+        let form_class = self
+            .class_context_of_current_method()?
+            .static_class_literal(self.db())?
+            .0;
+        django_form_declared_field(self.db(), form_class, field_name.value.to_str())
     }
 
     pub(super) fn infer_subscript_load_impl(
